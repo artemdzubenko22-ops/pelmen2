@@ -1,7 +1,7 @@
 -- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
--- v8: velocity passthrough (CFrame-projectiles), projectile-aware wall check, always-4-dir fallback, auto distance.
+-- v9: path-clear check (never teleport into projectile's trajectory), cast-through projectiles, auto-dist by width.
 
-print("[FNVB] loading v8...")
+print("[FNVB] loading v9...")
 
 local Players, UIS, RunService, RS =
     game:GetService("Players"), game:GetService("UserInputService"),
@@ -43,19 +43,17 @@ local state = {
         enabled      = false,
         hoverEnabled = false,
         reactRadius  = 55,
-        autoMinDist  = 8,
-        autoMaxDist  = 30,
+        autoMinDist  = 10,
+        autoMaxDist  = 32,
         _lastHealth  = nil,
         _dodges      = 0,
         _refused     = 0,
         _emergency   = 0,
         _reEngage    = 0,
-        _calibN      = 0,
-        _calibSpeed  = 0,
-        _avgSpeed    = 30,
+        _noSpace     = 0,
     },
     follow = { enabled = false, targetName = "", offset = Vector3.new(0, 5, 0),
-               _target = nil, _lastPos = nil },
+               _target = nil, _lastPos = nil, _pauseUntil = 0 },
     parts  = { filter = "", showAnchoredOnly = false, maxList = 200, _list = {} },
     intel  = { liveSignals = 0 },
 }
@@ -77,13 +75,11 @@ local function updateHover()
     if not char or not hrp or not hum then return end
     if state.dodge.hoverEnabled and hum.Health > 0 then
         if not hoverAtt or not hoverAtt.Parent then
-            hoverAtt = Instance.new("Attachment")
-            hoverAtt.Name = "FNV_HoverAtt"; hoverAtt.Parent = hrp
+            hoverAtt = Instance.new("Attachment"); hoverAtt.Name = "FNV_HoverAtt"; hoverAtt.Parent = hrp
         end
         if not hoverLV or not hoverLV.Parent then
             hoverLV = Instance.new("LinearVelocity")
-            hoverLV.Attachment0 = hoverAtt
-            hoverLV.VectorVelocity = Vector3.zero
+            hoverLV.Attachment0 = hoverAtt; hoverLV.VectorVelocity = Vector3.zero
             hoverLV.MaxForce = math.huge
             hoverLV.RelativeTo = Enum.ActuatorRelativeTo.World
             hoverLV.Parent = hrp
@@ -91,10 +87,8 @@ local function updateHover()
         if not hoverAO or not hoverAO.Parent then
             hoverAO = Instance.new("AlignOrientation")
             hoverAO.Mode = Enum.OrientationAlignmentMode.OneAttachment
-            hoverAO.Attachment0 = hoverAtt
-            hoverAO.CFrame = hrp.CFrame
-            hoverAO.MaxTorque = math.huge
-            hoverAO.Responsiveness = 30
+            hoverAO.Attachment0 = hoverAtt; hoverAO.CFrame = hrp.CFrame
+            hoverAO.MaxTorque = math.huge; hoverAO.Responsiveness = 30
             hoverAO.Parent = hrp
         end
         hum.PlatformStand = true
@@ -185,8 +179,8 @@ outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Pa
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
-local dragBar = mkBtn(header, "FNVB8",
-    UDim2.fromOffset(6, 0), UDim2.new(0, 50, 1, 0), Color3.fromRGB(0, 0, 0))
+local dragBar = mkBtn(header, "FNVB9", UDim2.fromOffset(6, 0),
+    UDim2.new(0, 50, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1; dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
 dragBar.TextXAlignment = Enum.TextXAlignment.Left; dragBar.TextSize = 12
 
@@ -210,8 +204,7 @@ end
 local function makeTab(text, key)
     local b = mkBtn(tabBar, text, nil, UDim2.new(1/3, -2, 1, 0), Color3.fromRGB(40, 40, 52))
     b.TextColor3 = Color3.fromRGB(180, 180, 190); b.TextSize = 10
-    b.Activated:Connect(function() switchTab(key) end)
-    tabs[key] = b
+    b.Activated:Connect(function() switchTab(key) end); tabs[key] = b
 end
 makeTab("PARTS", "parts"); makeTab("DODGE", "dodge"); makeTab("FOLLOW", "follow")
 
@@ -334,9 +327,9 @@ end)
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 500)
+local panelDodge = makePanel("dodge", 520)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v8", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v9", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
 
@@ -346,7 +339,7 @@ hoverBtn = mkBtn(panelDodge, "○ ЗАСТЫТЬ В ВОЗДУХЕ [H]",
 hoverBtn.Activated:Connect(function() setHover(not state.dodge.hoverEnabled) end)
 
 local dodgeStats = mkLabel(panelDodge,
-    "рывков: 0 · срочных: 0 · отказов: 0 · пере-рывков: 0",
+    "рывков: 0 · срочных: 0 · отказов: 0 · нет места: 0",
     UDim2.fromOffset(0, 54), UDim2.new(1, 0, 0, 14))
 dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
@@ -380,8 +373,8 @@ local scanScriptsBtn = mkBtn(panelDodge, "СКАН СКРИПТЫ + РЕМОУТ
     UDim2.fromOffset(0, 310), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
 
 mkLabel(panelDodge,
-    "v8: velocity прокидывается из дельта-трекера (ловит CFrame-атаки). wallClear игнорирует сами снаряды. Приоритет: от снаряда → от impact → перпендикуляр → кардинал. Вертикаль — только если всё заложено.",
-    UDim2.fromOffset(0, 334), UDim2.new(1, 0, 0, 90)).TextSize = 9
+    "v9: destination не на пути снаряда. wallClear кастует сквозь projectiles. Cardinal — last resort. Дистанция — авто от размера снаряда.",
+    UDim2.fromOffset(0, 334), UDim2.new(1, 0, 0, 70)).TextSize = 9
 
 --==================================================
 -- ENGINE PARAMS
@@ -406,17 +399,16 @@ local tracked = {}
 local trackLastCleanup = 0
 local TRACK_TTL = 0.4
 
--- error tracking
 local errCount, lastErr = 0, ""
 
 local function getStatsText()
     local d = state.dodge
-    return string.format("рывков: %d · срочных: %d · отказов: %d · пере-рывков: %d",
-        d._dodges, d._emergency, d._refused, d._reEngage)
+    return string.format("рывков: %d · срочных: %d · отказов: %d · нет места: %d",
+        d._dodges, d._emergency, d._refused, d._noSpace)
 end
 
 --==================================================
--- CLASSIFY + ANALYZE (with velocity passthrough)
+-- CLASSIFY + ANALYZE
 --==================================================
 
 local function classifyThreat(part)
@@ -429,7 +421,6 @@ local function classifyThreat(part)
     return "projectile"
 end
 
--- v8: velOverride — передаём из дельта-трекера
 local function analyzeThreat(part, myPos, velOverride)
     local vel = velOverride or part.AssemblyLinearVelocity
     local mag = vel.Magnitude
@@ -443,46 +434,62 @@ local function analyzeThreat(part, myPos, velOverride)
     if closing <= 0.1 then return nil end
     local tti = dist / closing
 
-    -- калибровка средней скорости
-    local d = state.dodge
-    d._calibN += 1; d._calibSpeed += mag
-    if d._calibN >= 25 then
-        d._avgSpeed = d._calibSpeed / d._calibN
-        d._calibN = 0; d._calibSpeed = 0
-    end
-
     return {
         tti = tti,
         impact = part.Position + vel * tti,
         partPos = part.Position,
-        vel = vel,
-        dist = dist,
-        approach = approach,
-        mag = mag,
+        vel = vel, dist = dist, approach = approach, mag = mag,
         partSize = part.Size.Magnitude,
         type = classifyThreat(part),
+        part = part,
     }
 end
 
 --==================================================
--- AUTO DISTANCE
+-- AUTO DISTANCE (accounts for projectile WIDTH)
 --==================================================
 
 local function computeAutoDist(threat)
     if not threat then return 14 end
     local d = state.dodge
+    local halfW = (threat.partSize or 4) * 0.5
     local base = 10
-    base += math.min(threat.partSize or 5, 20) * 0.35
-    base += math.min((threat.mag or 0) / 100, 2.5) * 4
-    if threat.tti and threat.tti < 0.15 then base *= 1.35 end
+    -- speed factor
+    base += math.min((threat.mag or 0) / 100, 2.5) * 3
+    -- proximity to impact
+    if threat.tti and threat.tti < 0.15 then base *= 1.25 end
+    -- CRITICAL: destination must escape the projectile's own width
+    base = math.max(base, halfW + 8)
     return math.clamp(base, d.autoMinDist, d.autoMaxDist)
 end
 
 --==================================================
--- WALL / FLOOR / FULL SAFE
+-- PATH CLEAR (не на пути снаряда)
 --==================================================
 
--- снаряд — не стена
+local function pathClear(dest, threat)
+    if not threat or not threat.partPos then return true end
+    -- destination must not be too close to projectile CURRENT position
+    local projHalf = (threat.partSize or 4) * 0.5
+    if (dest - threat.partPos).Magnitude < projHalf + 3 then return false end
+    -- check if dest is in front of projectile in its direction of travel
+    local v = threat.vel
+    if not v or v.Magnitude < 0.1 then return true end
+    local vUnit = v.Unit
+    local toDest = dest - threat.partPos
+    local alongPath = toDest:Dot(vUnit)
+    if alongPath < 0 then return true end   -- behind projectile — safe
+    -- dest is ahead: check perpendicular distance from flight line
+    local perpVec = toDest - vUnit * alongPath
+    local perpDist = perpVec.Magnitude
+    local minSafe = projHalf + 4
+    return perpDist > minSafe
+end
+
+--==================================================
+-- WALL / FLOOR
+--==================================================
+
 local function isRealWall(hitPart)
     if not hitPart or not hitPart.Parent then return false end
     if char and hitPart:IsDescendantOf(char) then return false end
@@ -495,40 +502,30 @@ local function isRealWall(hitPart)
     return true
 end
 
+-- v9: cast THROUGH projectiles — see wall behind them
 local function wallClear(pos)
     if not hrp then return true end
     wallParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
-    local d = pos - hrp.Position
-    if d.Magnitude < 0.1 then return true end
-    local hit = workspace:Raycast(hrp.Position, d, wallParams)
-    if not hit then return true end
-    return not isRealWall(hit.Instance)
-end
-
-local function hasFloor(pos)
-    floorParams.FilterDescendantsInstances = { char }
-    return workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -20, 0), floorParams) ~= nil
-end
-
-local function fullSafe(pos)
-    if not wallClear(pos) then return false end
-    -- пол проверяем только если стоим на земле
-    if hum and hum.FloorMaterial ~= Enum.Material.Air then
-        if not hasFloor(pos) then return false end
-    end
-    threatParams.FilterDescendantsInstances = { char }
-    local parts = workspace:GetPartBoundsInRadius(pos, 2.5, threatParams)
-    for _, p in ipairs(parts) do
-        if not p:IsDescendantOf(char) then
-            local cls = classifyThreat(p)
-            if cls == "beam" or cls == "vfx" or nameIsAttack(p.Name) then return false end
-        end
+    local from = hrp.Position
+    for _ = 1, 4 do
+        local d = pos - from
+        if d.Magnitude < 0.3 then return true end
+        local hit = workspace:Raycast(from, d, wallParams)
+        if not hit then return true end
+        if isRealWall(hit.Instance) then return false end
+        from = hit.Position + d.Unit * 0.3
     end
     return true
 end
 
+local function hasFloor(pos)
+    floorParams.FilterDescendantsInstances = { char }
+    return workspace:Raycast(pos + Vector3.new(0, 0.5, 0),
+        Vector3.new(0, -20, 0), floorParams) ~= nil
+end
+
 --==================================================
--- BUILD BASES (направления)
+-- BUILD BASES — perpendiculars first, cardinal last
 --==================================================
 
 local function buildBases(myPos, threat)
@@ -543,85 +540,93 @@ local function buildBases(myPos, threat)
         seen[k] = true
         bases[#bases + 1] = v
     end
-    if threat then
-        -- 1) ОТ СНАРЯДА (главное — даже если impact ≈ player)
-        if threat.partPos then add(myPos - threat.partPos) end
-        -- 2) от предсказанной точки удара
-        if threat.impact then add(myPos - threat.impact) end
-        -- 3) перпендикуляры к скорости
-        if threat.vel and threat.vel.Magnitude > 0.1 then
-            local v = Vector3.new(threat.vel.X, 0, threat.vel.Z)
-            if v.Magnitude > 0.1 then
-                v = v.Unit
-                add(Vector3.new(-v.Z, 0, v.X))
-                add(Vector3.new(v.Z, 0, -v.X))
-                -- 4) назад вдоль скорости
-                add(-v)
+    -- 1) PERPENDICULAR к скорости — самый безопасный
+    if threat and threat.vel and threat.vel.Magnitude > 0.5 then
+        local v = Vector3.new(threat.vel.X, 0, threat.vel.Z)
+        if v.Magnitude > 0.1 then
+            v = v.Unit
+            add(Vector3.new(-v.Z, 0, v.X))
+            add(Vector3.new(v.Z, 0, -v.X))
+        end
+    end
+    -- 2) away от снаряда (усиливает перп если снаряд сбоку)
+    if threat and threat.partPos then
+        add(myPos - threat.partPos)
+    end
+    -- 3) диагональ перп + away
+    if threat and threat.vel and threat.partPos then
+        local v = threat.vel
+        if v.Magnitude > 0.5 then
+            local vh = Vector3.new(v.X, 0, v.Z)
+            if vh.Magnitude > 0.1 then
+                vh = vh.Unit
+                local p1 = Vector3.new(-vh.Z, 0, vh.X)
+                local p2 = -p1
+                local a = myPos - threat.partPos
+                a = Vector3.new(a.X, 0, a.Z)
+                if a.Magnitude > 0.1 then
+                    a = a.Unit
+                    add((p1 + a * 0.7).Unit)
+                    add((p2 + a * 0.7).Unit)
+                end
             end
         end
     end
-    -- всегда добавляем 4 кардинала как fallback (дедуп через seen)
+    -- 4) cardinal — LAST resort
     for _, c in ipairs(CARDINAL) do add(c) end
     return bases
 end
 
 --==================================================
--- FIND SAFE POSITION — v8 гарантирует горизонталь
+-- VALIDATE SPOT
 --==================================================
 
-local function findSafeDodgePosition(myPos, threat, urgency)
-    local dd = computeAutoDist(threat)
-    local bases = buildBases(myPos, threat)
-
-    if urgency == "emergency" then
-        -- пробуем ВСЕ базы, wallClear only
-        for _, b in ipairs(bases) do
-            local p = myPos + b * dd
-            if wallClear(p) then return p, dd end
-        end
-        -- половина дистанции
-        for _, b in ipairs(bases) do
-            local p = myPos + b * (dd * 0.6)
-            if wallClear(p) then return p, dd * 0.6 end
-        end
-        -- совсем последний шанс: кардинал full
-        for _, c in ipairs(CARDINAL) do
-            local p = myPos + c * dd
-            if wallClear(p) then return p, dd end
-        end
-        -- вертикаль — только если реально зажат
-        return nil
-    elseif urgency == "fast" then
-        for _, b in ipairs(bases) do
-            local p = myPos + b * dd
-            if wallClear(p) then return p, dd end
-        end
-        -- кардинал fallback
-        for _, c in ipairs(CARDINAL) do
-            local p = myPos + c * dd
-            if wallClear(p) then return p, dd end
-        end
-        return nil
-    else
-        -- normal: веер ±45° вокруг каждой базы + кардиналы
-        for _, b in ipairs(bases) do
-            for angle = -45, 45, 15 do
-                local rot = CFrame.Angles(0, math.rad(angle), 0)
-                local dir = rot * b
-                dir = Vector3.new(dir.X, 0, dir.Z)
-                if dir.Magnitude > 0.01 then
-                    local p = myPos + dir.Unit * dd
-                    if fullSafe(p) then return p, dd end
+local function isSpotSafe(pos, allThreats, urgency)
+    -- MUST be outside all projectiles' forward path
+    for _, t in ipairs(allThreats) do
+        if not pathClear(pos, t) then return false end
+    end
+    -- MUST not hit a wall
+    if not wallClear(pos) then return false end
+    -- floor check only if currently on ground (skip if flying/falling)
+    if hum and hum.FloorMaterial ~= Enum.Material.Air then
+        if not hasFloor(pos) then return false end
+    end
+    -- deep check for normal
+    if urgency == "normal" then
+        threatParams.FilterDescendantsInstances = { char }
+        local threats = workspace:GetPartBoundsInRadius(pos, 2.5, threatParams)
+        for _, p in ipairs(threats) do
+            if not p:IsDescendantOf(char) then
+                local cls = classifyThreat(p)
+                if cls == "beam" or cls == "vfx" or nameIsAttack(p.Name) then
+                    return false
                 end
             end
         end
-        -- кардинал без веера
-        for _, c in ipairs(CARDINAL) do
-            local p = myPos + c * dd
-            if fullSafe(p) then return p, dd end
-        end
-        return nil
     end
+    return true
+end
+
+--==================================================
+-- FIND SAFE DODGE POSITION
+--==================================================
+
+local function findSafeDodgePosition(myPos, primaryThreat, allThreats, urgency)
+    local dd = computeAutoDist(primaryThreat)
+    local bases = buildBases(myPos, primaryThreat)
+
+    -- пробуем разные расстояния: 100%, 85%, 115%, 70%, 130%
+    local dists = { dd, dd * 0.85, dd * 1.15, dd * 0.7, dd * 1.3 }
+    for _, useDist in ipairs(dists) do
+        for _, b in ipairs(bases) do
+            local pos = myPos + b * useDist
+            if isSpotSafe(pos, allThreats, urgency) then
+                return pos, useDist
+            end
+        end
+    end
+    return nil
 end
 
 --==================================================
@@ -640,7 +645,6 @@ local function applyDodge(safePos, type)
         end
         return false
     end
-    -- КРИТИЧНО: стоп физику
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
     return true
@@ -657,7 +661,7 @@ end
 -- TRY DODGE
 --==================================================
 
-local function tryDodge(part, threat)
+local function tryDodge(part, threat, allThreats)
     if not threat or not hrp then return false end
     local now = os.clock()
     local ts = threatState[part]
@@ -675,11 +679,11 @@ local function tryDodge(part, threat)
         state.dodge._reEngage += 1
     end
 
-    local safe, usedDist = findSafeDodgePosition(hrp.Position, threat, urgency)
+    local safe, usedDist = findSafeDodgePosition(hrp.Position, threat, allThreats, urgency)
     if not safe then
         ts.lastDodge = now; ts.lastDist = threat.dist
         threatState[part] = ts
-        state.dodge._refused += 1
+        state.dodge._noSpace += 1
         dodgeStats.Text = getStatsText()
         return false
     end
@@ -688,8 +692,9 @@ local function tryDodge(part, threat)
     ts.lastDodge = now; ts.lastDist = threat.dist
     threatState[part] = ts
     registerDodge(urgency)
-    -- обновляем инфо-лейбл авто-дистанции
     distLabel.Text = string.format("авто-дистанция: ~%.0f studs", usedDist or 14)
+    -- v9: pause follow so it doesn't teleport us back into danger
+    state.follow._pauseUntil = now + 0.3
     return true
 end
 
@@ -727,12 +732,10 @@ workspace.DescendantAdded:Connect(function(o)
                         if now - (lastSpawnDodge[part] or 0) > 0.10 then
                             lastSpawnDodge[part] = now
                             state.intel.liveSignals += 1
-                            -- первый анализ: если velocity=0 (CFrame), ждём дельту
                             local threat = analyzeThreat(part, myPos)
                             if threat then
-                                tryDodge(part, threat)
+                                tryDodge(part, threat, { threat })
                             else
-                                -- частый случай: anchored+CFrame → ждём следующего кадра для дельты
                                 spawnTrack[part] = { pos = part.Position, t = now }
                             end
                         end
@@ -745,7 +748,7 @@ workspace.DescendantAdded:Connect(function(o)
 end)
 
 --==================================================
--- HEARTBEAT (dodge + follow)
+-- HEARTBEAT
 --==================================================
 
 RunService.Heartbeat:Connect(function()
@@ -753,7 +756,7 @@ RunService.Heartbeat:Connect(function()
 
     -- ==== FOLLOW ====
     local f = state.follow
-    if f.enabled and char then
+    if f.enabled and char and now > f._pauseUntil then
         if not f._target or not f._target.Parent then
             f._target = findPartByName(f.targetName)
             if f._target then
@@ -786,15 +789,21 @@ RunService.Heartbeat:Connect(function()
     -- health fallback
     if d._lastHealth and hum.Health < d._lastHealth - 0.01 then
         state.intel.liveSignals += 1
-        local safe = findSafeDodgePosition(myPos, nil, "emergency")
-        if safe and applyDodge(safe, "emergency") then registerDodge("emergency") end
+        local safe, usedDist = findSafeDodgePosition(myPos, nil, {}, "emergency")
+        if safe and applyDodge(safe, "emergency") then
+            registerDodge("emergency")
+            state.follow._pauseUntil = now + 0.3
+            distLabel.Text = string.format("авто-дистанция: ~%.0f studs", usedDist or 14)
+        end
     end
     d._lastHealth = hum.Health
 
     overlapParams.FilterDescendantsInstances = { char }
     local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
 
-    local bestPart, bestThreat, bestScore = nil, nil, 0
+    -- COLLECT ALL THREATS this frame
+    local allThreats = {}
+    local bestThreat, bestScore = nil, 0
     for _, part in ipairs(parts) do
         if part ~= hrp then
             local tr = tracked[part]
@@ -805,29 +814,31 @@ RunService.Heartbeat:Connect(function()
             end
             tracked[part] = { pos = part.Position, t = now, lastSeen = now }
 
-            -- v8: выбираем максимальную скорость — физическую ИЛИ дельту
-            local physVel = part.AssemblyLinearVelocity
-            local vel = physVel
+            local vel = part.AssemblyLinearVelocity
             if velFromDelta and velFromDelta.Magnitude > vel.Magnitude then vel = velFromDelta end
 
             if vel.Magnitude >= 5 then
-                -- v8: передаём vel внутрь analyzeThreat!
                 local threat = analyzeThreat(part, myPos, vel)
                 if threat then
-                    local pri = 1
-                    if threat.type == "beam" then pri = 3
-                    elseif threat.type == "named" then pri = 2 end
+                    -- collect all potentially dangerous
+                    if threat.tti < 0.6 or threat.approach > 0.3 then
+                        allThreats[#allThreats + 1] = threat
+                    end
+                    -- score for primary
                     if threat.tti < 0.30 or threat.approach > 0.5 then
+                        local pri = 1
+                        if threat.type == "beam" then pri = 3
+                        elseif threat.type == "named" then pri = 2 end
                         local score = pri * 10 + (1 - math.min(threat.tti, 1))
                         if score > bestScore then
-                            bestPart, bestThreat, bestScore = part, threat, score
+                            bestThreat, bestScore = threat, score
                         end
                     end
                 end
             end
 
             -- melee
-            if not bestPart and part.Name == "HumanoidRootPart" then
+            if part.Name == "HumanoidRootPart" then
                 local model = part.Parent
                 if model and model ~= char then
                     local eHum = model:FindFirstChildOfClass("Humanoid")
@@ -836,13 +847,14 @@ RunService.Heartbeat:Connect(function()
                         local dist = toPlayer.Magnitude
                         if dist < 12 and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
                             local safe = findSafeDodgePosition(myPos, {
-                                partPos = part.Position,
-                                impact = part.Position,
-                                vel = toPlayer,
-                                dist = dist, tti = 0.1, mag = 20,
-                                partSize = 4,
-                            }, "fast")
-                            if safe and applyDodge(safe, "fast") then registerDodge("fast") end
+                                partPos = part.Position, impact = part.Position,
+                                vel = toPlayer, dist = dist, tti = 0.1,
+                                mag = 20, partSize = 4,
+                            }, allThreats, "fast")
+                            if safe and applyDodge(safe, "fast") then
+                                registerDodge("fast")
+                                state.follow._pauseUntil = now + 0.3
+                            end
                         end
                     end
                 end
@@ -850,7 +862,7 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    -- spawn-track deferred threats (для anchored+CFrame)
+    -- spawn-track deferred threats
     for part, tr in pairs(spawnTrack) do
         if not part.Parent then spawnTrack[part] = nil
         else
@@ -860,7 +872,7 @@ RunService.Heartbeat:Connect(function()
                 if vel.Magnitude >= 5 then
                     local threat = analyzeThreat(part, myPos, vel)
                     if threat and threat.tti < 0.25 then
-                        tryDodge(part, threat)
+                        tryDodge(part, threat, allThreats)
                     end
                 end
                 if now - tr.t > 0.3 then spawnTrack[part] = nil end
@@ -868,9 +880,10 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
-    if bestPart and bestThreat then
+    -- primary threat dodge
+    if bestThreat then
         state.intel.liveSignals += 1
-        tryDodge(bestPart, bestThreat)
+        tryDodge(bestThreat.part, bestThreat, allThreats)
     end
 
     -- cleanup
@@ -896,8 +909,11 @@ local function hookRemote(inst)
     inst.OnClientEvent:Connect(function()
         if nameIsAttack(inst.Name) and state.dodge.enabled and hrp then
             state.intel.liveSignals += 1
-            local safe = findSafeDodgePosition(hrp.Position, nil, "emergency")
-            if safe and applyDodge(safe, "emergency") then registerDodge("emergency") end
+            local safe = findSafeDodgePosition(hrp.Position, nil, {}, "emergency")
+            if safe and applyDodge(safe, "emergency") then
+                registerDodge("emergency")
+                state.follow._pauseUntil = os.clock() + 0.3
+            end
         end
     end)
 end
@@ -1061,7 +1077,7 @@ closeBtn.Activated:Connect(function() frame.Visible = false; reopenBtn.Visible =
 reopenBtn.Activated:Connect(function() frame.Visible = true; reopenBtn.Visible = false end)
 
 --==================================================
--- KEYBINDS
+-- KEYBINDS + INIT
 --==================================================
 
 UIS.InputBegan:Connect(function(input, processed)
@@ -1073,10 +1089,6 @@ UIS.InputBegan:Connect(function(input, processed)
     end
 end)
 
---==================================================
--- INIT
---==================================================
-
 switchTab("parts"); scanWorkspace(); refreshPartList(); dodgeStats.Text = getStatsText()
 
-print("[FNVB] v8 loaded OK — velocity passthrough + 4-dir fallback + auto-dist")
+print("[FNVB] v9 loaded OK — path-aware dodge ready")
