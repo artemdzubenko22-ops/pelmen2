@@ -1,18 +1,19 @@
 -- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
--- v10: in-place tracked mutation, global dodge CD, capped tables, follow suppressed under threat, candidate cap.
+-- v11: static zone detection, GetTouchingParts, CollectionService tags, extended spawnTrack, lenient flying filter.
 
-print("[FNVB] loading v10...")
+print("[FNVB] loading v11...")
 
-local Players, UIS, RunService, RS =
+local Players, UIS, RunService, RS, CS =
     game:GetService("Players"), game:GetService("UserInputService"),
-    game:GetService("RunService"), game:GetService("ReplicatedStorage")
+    game:GetService("RunService"), game:GetService("ReplicatedStorage"),
+    game:GetService("CollectionService")
 
 local player = Players.LocalPlayer
 if not player then return end
 local playerGui = player:WaitForChild("PlayerGui")
 
 --==================================================
--- ATTACK VOCAB
+-- VOCAB
 --==================================================
 
 local ATK_KEYS = {
@@ -20,11 +21,23 @@ local ATK_KEYS = {
     "fire","explode","bomb","projectile","bullet","beam","melee","stab",
     "strike","kill","hurt","weapon","sword","blast","pierce","lunge",
     "bone","spike","gaster","blaster","hand","smash","pull","meteor",
+    "zone","hazard","hitbox","aoe","range","danger",
 }
 local function nameIsAttack(name)
     local n = string.lower(name)
     for i = 1, #ATK_KEYS do
         if string.find(n, ATK_KEYS[i], 1, true) then return true end
+    end
+    return false
+end
+
+local HOT_TAGS = {
+    "Projectile","Attack","Damage","Hitbox","Hazard",
+    "DamageZone","Bullet","Enemy","Kill","Danger",
+}
+local function hasHotTag(part)
+    for i = 1, #HOT_TAGS do
+        if CS:HasTag(part, HOT_TAGS[i]) then return true end
     end
     return false
 end
@@ -42,19 +55,21 @@ local state = {
     dodge = {
         enabled      = false,
         hoverEnabled = false,
-        reactRadius  = 50,
+        reactRadius  = 55,
         autoMinDist  = 10,
-        autoMaxDist  = 30,
+        autoMaxDist  = 32,
         _lastHealth  = nil,
         _dodges      = 0,
         _refused     = 0,
         _emergency   = 0,
         _reEngage    = 0,
         _noSpace     = 0,
+        _staticDodges = 0,
+        _touchDodges  = 0,
         _lastGlobalDodge = 0,
-        _globalCD    = 0.08,       -- v10: глобальный кулдаун на любой TP
-        _attempted   = false,      -- v10: один TP за кадр
-        _underThreat = false,      -- v10: для follow-изоляции
+        _globalCD    = 0.08,
+        _attempted   = false,
+        _underThreat = false,
     },
     follow = { enabled = false, targetName = "", offset = Vector3.new(0, 5, 0),
                _target = nil, _lastPos = nil, _pauseUntil = 0 },
@@ -172,7 +187,7 @@ gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 50; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(280, 380)
+frame.Size = UDim2.fromOffset(280, 400)
 frame.Position = UDim2.new(0, 20, 0.08, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
 frame.BorderSizePixel = 0; frame.Active = true
@@ -183,7 +198,7 @@ outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Pa
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
-local dragBar = mkBtn(header, "FNVB10", UDim2.fromOffset(6, 0),
+local dragBar = mkBtn(header, "FNVB11", UDim2.fromOffset(6, 0),
     UDim2.new(0, 56, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1; dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
 dragBar.TextXAlignment = Enum.TextXAlignment.Left; dragBar.TextSize = 12
@@ -331,9 +346,9 @@ end)
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 520)
+local panelDodge = makePanel("dodge", 560)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v10", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v11", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
 
@@ -343,7 +358,7 @@ hoverBtn = mkBtn(panelDodge, "○ ЗАСТЫТЬ В ВОЗДУХЕ [H]",
 hoverBtn.Activated:Connect(function() setHover(not state.dodge.hoverEnabled) end)
 
 local dodgeStats = mkLabel(panelDodge,
-    "рывков: 0 · срочных: 0 · отказов: 0 · нет места: 0",
+    "рывков: 0 · статик: 0 · тач: 0 · отказов: 0",
     UDim2.fromOffset(0, 54), UDim2.new(1, 0, 0, 14))
 dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
@@ -351,7 +366,7 @@ local distLabel = mkLabel(panelDodge, "авто-дистанция: ~14 studs",
     UDim2.fromOffset(0, 72), UDim2.new(1, 0, 0, 14))
 distLabel.TextColor3 = Color3.fromRGB(255, 200, 80); distLabel.TextSize = 10
 
-local perfLabel = mkLabel(panelDodge, "FPS-нагрузка: OK · tracked: 0",
+local perfLabel = mkLabel(panelDodge, "tracked: 0 · threats: 0",
     UDim2.fromOffset(0, 90), UDim2.new(1, 0, 0, 12))
 perfLabel.TextColor3 = Color3.fromRGB(150, 200, 255); perfLabel.TextSize = 9
 
@@ -377,8 +392,8 @@ local scanScriptsBtn = mkBtn(panelDodge, "СКАН СКРИПТЫ + РЕМОУТ
     UDim2.fromOffset(0, 310), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
 
 mkLabel(panelDodge,
-    "v10: глобальный CD 80ms между TP, follow выключен под угрозой, candidate cap 12, in-place tracked (GC ~0), таблицы capped.",
-    UDim2.fromOffset(0, 334), UDim2.new(1, 0, 0, 70)).TextSize = 9
+    "v11: статические зоны (velocity=0) детектятся по близости (6.5 studs) + GetTouchingParts + CollectionService-теги. Flying: lenient фильтр (dist<12 или tti<0.5 или approach>0.3).",
+    UDim2.fromOffset(0, 334), UDim2.new(1, 0, 0, 90)).TextSize = 9
 
 --==================================================
 -- ENGINE PARAMS
@@ -386,7 +401,7 @@ mkLabel(panelDodge,
 
 local overlapParams = OverlapParams.new()
 overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-overlapParams.MaxParts = 12          -- v10: 12 вместо 30
+overlapParams.MaxParts = 15
 
 local wallParams = RaycastParams.new()
 wallParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -398,12 +413,11 @@ local threatParams = OverlapParams.new()
 threatParams.FilterType = Enum.RaycastFilterType.Exclude
 threatParams.MaxParts = 5
 
--- v10: hard caps на все таблицы
 local MAX_TRACKED      = 100
-local MAX_THREATSTATE  = 80
+local MAX_THREATSTATE  = 100
 local MAX_SPAWNTRACK   = 40
 local MAX_SPAWNDODGE   = 40
-local MAX_CANDIDATES   = 12          -- v10: после 12 неудач — отказ
+local MAX_CANDIDATES   = 12
 
 local threatState   = {}
 local tracked       = {}
@@ -412,14 +426,9 @@ local lastSpawnDodge = {}
 local trackedCount  = 0
 local trackLastCleanup = 0
 local TRACK_TTL = 0.4
-
-local errCount, lastErr = 0, ""
-
-local function getStatsText()
-    local d = state.dodge
-    return string.format("рывков: %d · срочных: %d · отказов: %d · нет места: %d",
-        d._dodges, d._emergency, d._refused, d._noSpace)
-end
+local SPAWNTRACK_TTL = 1.2      -- v11: было 0.3, ловит медленный старт
+local lastTouchCheck = 0
+local lastStaticCheck = 0
 
 --==================================================
 -- CLASSIFY
@@ -431,18 +440,34 @@ local function classifyThreat(part)
         or part:FindFirstChildWhichIsA("Trail")
         or part:FindFirstChildWhichIsA("Fire") then return "vfx" end
     if nameIsAttack(part.Name) then return "named" end
+    if hasHotTag(part) then return "tagged" end
     return "projectile"
 end
 
+-- v11: универсальный детект "опасная часть"
+local function isDangerPart(part)
+    if not part or not part.Parent then return false end
+    if char and part:IsDescendantOf(char) then return false end
+    local cls = classifyThreat(part)
+    if cls == "beam" or cls == "vfx" or cls == "named" or cls == "tagged" then
+        return true
+    end
+    -- мелкие динамические части = вероятные снаряды
+    if part.Size.Magnitude < 8 and not part.Anchored then return true end
+    -- нет коллизии + маленький размер = транспарентный хитбокс
+    if not part.CanCollide and part.Size.Magnitude < 15 then return true end
+    return false
+end
+
 --==================================================
--- ANALYZE (v10: никаких аллокаций — таблица из пула)
+-- ANALYZE (velocity + fake static)
 --==================================================
 
 local analysisPool = {}
 local analysisIdx = 0
 local function getAnalysis()
     analysisIdx = analysisIdx + 1
-    if analysisIdx > 20 then analysisIdx = 1 end
+    if analysisIdx > 25 then analysisIdx = 1 end
     if not analysisPool[analysisIdx] then analysisPool[analysisIdx] = {} end
     return analysisPool[analysisIdx]
 end
@@ -450,7 +475,7 @@ end
 local function analyzeThreat(part, myPos, velOverride)
     local vel = velOverride or part.AssemblyLinearVelocity
     local mag = vel.Magnitude
-    if mag < 5 then return nil end
+    if mag < 3 then return nil end    -- v11: было 5
     local dx = myPos.X - part.Position.X
     local dy = myPos.Y - part.Position.Y
     local dz = myPos.Z - part.Position.Z
@@ -458,9 +483,9 @@ local function analyzeThreat(part, myPos, velOverride)
     if dist < 0.5 then return nil end
     local invDist = 1 / dist
     local approach = (vel.X*dx + vel.Y*dy + vel.Z*dz) * invDist / mag
-    if approach < 0.10 then return nil end
+    if approach < 0.05 then return nil end  -- v11: было 0.10
     local closing = mag * approach
-    if closing <= 0.1 then return nil end
+    if closing <= 0.05 then return nil end
     local tti = dist / closing
 
     local a = getAnalysis()
@@ -471,6 +496,26 @@ local function analyzeThreat(part, myPos, velOverride)
     a.dist = dist
     a.approach = approach
     a.mag = mag
+    a.partSize = part.Size.Magnitude
+    a.type = classifyThreat(part)
+    a.part = part
+    return a
+end
+
+-- v11: fake threat для статических зон
+local function makeStaticThreat(part, myPos)
+    local dx = myPos.X - part.Position.X
+    local dy = myPos.Y - part.Position.Y
+    local dz = myPos.Z - part.Position.Z
+    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+    local a = getAnalysis()
+    a.tti = 0.05
+    a.partPos = part.Position
+    a.impact = part.Position
+    a.vel = Vector3.new(0.1, 0, 0.1)
+    a.dist = dist
+    a.approach = 1
+    a.mag = 5
     a.partSize = part.Size.Magnitude
     a.type = classifyThreat(part)
     a.part = part
@@ -502,9 +547,11 @@ local function pathClear(dest, threat)
     local dx = dest.X - threat.partPos.X
     local dy = dest.Y - threat.partPos.Y
     local dz = dest.Z - threat.partPos.Z
-    if (dx*dx + dy*dy + dz*dz) < (projHalf + 3) * (projHalf + 3) then return false end
+    local dSq = dx*dx + dy*dy + dz*dz
+    local minDSq = (projHalf + 3) * (projHalf + 3)
+    if dSq < minDSq then return false end
     local v = threat.vel
-    if not v or v.Magnitude < 0.1 then return true end
+    if not v or v.Magnitude < 0.3 then return true end
     local vLen = v.Magnitude
     local vx, vy, vz = v.X/vLen, v.Y/vLen, v.Z/vLen
     local alongPath = dx*vx + dy*vy + dz*vz
@@ -519,17 +566,11 @@ end
 local function isRealWall(hitPart)
     if not hitPart or not hitPart.Parent then return false end
     if char and hitPart:IsDescendantOf(char) then return false end
-    local sz = hitPart.Size
-    if sz.Magnitude < 8 then return false end
-    if nameIsAttack(hitPart.Name) then return false end
-    if hitPart:FindFirstChildWhichIsA("ParticleEmitter")
-        or hitPart:FindFirstChildWhichIsA("Beam")
-        or hitPart:FindFirstChildWhichIsA("Trail")
-        or hitPart:FindFirstChildWhichIsA("Fire") then return false end
+    if hitPart.Size.Magnitude < 8 then return false end
+    if isDangerPart(hitPart) then return false end
     return true
 end
 
--- v10: single cast для emergency/fast, cast-through 3 для normal
 local function wallClear(pos, fastMode)
     if not hrp then return true end
     wallParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
@@ -553,10 +594,10 @@ local function hasFloor(pos)
 end
 
 --==================================================
--- BASES (v10: меньще, без near-duplicate floating point)
+-- BASES (v11: cardinal ВСЕГДА)
 --==================================================
 
-local function buildBases(myPos, threat, urgency)
+local function buildBases(myPos, threat)
     local bases, seen = {}, {}
     local function add(vx, vz)
         local m = math.sqrt(vx*vx + vz*vz)
@@ -568,7 +609,7 @@ local function buildBases(myPos, threat, urgency)
         bases[#bases + 1] = Vector3.new(vx, 0, vz)
     end
 
-    -- 1) перпендикуляры — самое безопасное
+    -- 1) перпендикуляры к скорости
     if threat and threat.vel and threat.vel.Magnitude > 0.5 then
         local v = threat.vel
         add(-v.Z, v.X)
@@ -578,59 +619,44 @@ local function buildBases(myPos, threat, urgency)
     if threat and threat.partPos then
         add(myPos.X - threat.partPos.X, myPos.Z - threat.partPos.Z)
     end
-    -- 3) cardinal
-    if urgency ~= "emergency" then
-        add(1, 0); add(-1, 0); add(0, 1); add(0, -1)
-    end
-    if #bases == 0 then add(1, 0); add(-1, 0) end
+    -- 3) CARDINAL всегда
+    add(1, 0); add(-1, 0); add(0, 1); add(0, -1)
+    -- 4) диагонали как запас
+    add(1, 1); add(-1, 1); add(1, -1); add(-1, -1)
     return bases
 end
 
 --==================================================
--- IS SPOT SAFE (v10: pathClear первым, потом wall, потом floor)
+-- SAFE POSITION
 --==================================================
 
 local function isSpotSafe(pos, threats, urgency)
-    -- 1) дешёвая проверка пути (no physics)
     for i = 1, #threats do
         if not pathClear(pos, threats[i]) then return false end
     end
-    -- 2) стена
     if not wallClear(pos, urgency == "emergency") then return false end
-    -- 3) пол (только если на земле)
     if urgency == "normal" and hum and hum.FloorMaterial ~= Enum.Material.Air then
         if not hasFloor(pos) then return false end
     end
-    -- 4) соседние атаки (только normal)
     if urgency == "normal" then
         threatParams.FilterDescendantsInstances = { char }
         local p = workspace:GetPartBoundsInRadius(pos, 2.5, threatParams)
         for i = 1, #p do
             local h = p[i]
-            if not h:IsDescendantOf(char) then
-                if h:FindFirstChildWhichIsA("Beam")
-                   or h:FindFirstChildWhichIsA("ParticleEmitter")
-                   or nameIsAttack(h.Name) then
-                    return false
-                end
-            end
+            if isDangerPart(h) then return false end
         end
     end
     return true
 end
 
---==================================================
--- FIND SAFE POSITION (v10: capped candidates)
---==================================================
-
 local function findSafeDodgePosition(myPos, primaryThreat, threats, urgency)
     local dd = computeAutoDist(primaryThreat)
-    local bases = buildBases(myPos, primaryThreat, urgency)
+    local bases = buildBases(myPos, primaryThreat)
     local dists
     if urgency == "emergency" then
-        dists = { dd }
+        dists = { dd, dd * 0.75 }
     elseif urgency == "fast" then
-        dists = { dd, dd * 0.85 }
+        dists = { dd, dd * 0.85, dd * 1.1 }
     else
         dists = { dd, dd * 0.85, dd * 1.15 }
     end
@@ -652,34 +678,34 @@ local function findSafeDodgePosition(myPos, primaryThreat, threats, urgency)
 end
 
 --==================================================
--- APPLY DODGE
+-- APPLY
 --==================================================
 
 local function applyDodge(safePos)
     if not char or not hrp then return false end
-    local ok, err = pcall(function() char:PivotTo(CFrame.new(safePos)) end)
-    if not ok then
-        errCount += 1
-        if lastErr == "" then
-            lastErr = tostring(err):sub(1, 50)
-        end
-        return false
-    end
+    local ok = pcall(function() char:PivotTo(CFrame.new(safePos)) end)
+    if not ok then return false end
     hrp.AssemblyLinearVelocity = Vector3.zero
     hrp.AssemblyAngularVelocity = Vector3.zero
     return true
 end
 
+local function getStatsText()
+    local d = state.dodge
+    return string.format("рывков: %d · статик: %d · тач: %d · отказов: %d",
+        d._dodges, d._staticDodges, d._touchDodges, d._refused + d._noSpace)
+end
+
 --==================================================
--- TRY DODGE (v10: глобальный CD + флаг кадра)
+-- TRY DODGE
 --==================================================
 
-local function tryDodge(part, threat, threats)
+local function tryDodge(part, threat, threats, isStatic)
     if not threat or not hrp then return false end
     local d = state.dodge
-    if d._attempted then return false end          -- v10: один TP за кадр
+    if d._attempted then return false end
     local now = os.clock()
-    if now - d._lastGlobalDodge < d._globalCD then return false end  -- v10: глобальный CD
+    if now - d._lastGlobalDodge < d._globalCD then return false end
 
     local ts = threatState[part]
     if not ts then
@@ -692,7 +718,10 @@ local function tryDodge(part, threat, threats)
     elseif threat.tti < 0.20 then urgency = "fast"
     else urgency = "normal" end
 
-    local cd = (urgency == "emergency") and 0.04 or 0.08
+    -- v11: для статики — свой кулдаун 0.35с на часть
+    local cd
+    if isStatic then cd = 0.35
+    else cd = (urgency == "emergency") and 0.04 or 0.08 end
     if now - ts.lastDodge < cd then return false end
 
     if ts.lastDodge > 0 and threat.dist < ts.lastDist - 0.5 then
@@ -715,17 +744,20 @@ local function tryDodge(part, threat, threats)
     ts.lastDodge = now; ts.lastDist = threat.dist
     d._dodges += 1
     if urgency == "emergency" then d._emergency += 1 end
+    if isStatic then
+        if isStatic == "touch" then d._touchDodges += 1
+        else d._staticDodges += 1 end
+    end
     d._lastGlobalDodge = now
     d._attempted = true
     dodgeStats.Text = getStatsText()
     distLabel.Text = string.format("авто-дистанция: ~%.0f studs", usedDist or 14)
-    -- v10: follow пауза
     state.follow._pauseUntil = now + 0.5
     return true
 end
 
 --==================================================
--- SPAWN DETECTOR (v10: capped batch)
+-- SPAWN DETECTOR
 --==================================================
 
 local pendingSpawn = {}
@@ -734,7 +766,7 @@ local spawnCheckQueued = false
 workspace.DescendantAdded:Connect(function(o)
     if not state.dodge.enabled then return end
     if not o:IsA("BasePart") then return end
-    if #pendingSpawn >= 50 then return end         -- v10: hard cap
+    if #pendingSpawn >= 50 then return end
     pendingSpawn[#pendingSpawn + 1] = o
     if spawnCheckQueued then return end
     spawnCheckQueued = true
@@ -745,7 +777,7 @@ workspace.DescendantAdded:Connect(function(o)
         local myPos = hrp.Position
         local processed = 0
         for i = 1, #list do
-            if processed >= 20 then break end      -- v10: max 20 per defer
+            if processed >= 20 then break end
             local part = list[i]
             if part.Parent then
                 local dx = part.Position.X - myPos.X
@@ -753,12 +785,9 @@ workspace.DescendantAdded:Connect(function(o)
                 local dz = part.Position.Z - myPos.Z
                 local distSq = dx*dx + dy*dy + dz*dz
                 if distSq <= state.dodge.reactRadius * state.dodge.reactRadius then
-                    local hot = distSq < 12
-                        or nameIsAttack(part.Name)
-                        or part:FindFirstChildWhichIsA("ParticleEmitter")
-                        or part:FindFirstChildWhichIsA("Beam")
-                        or part:FindFirstChildWhichIsA("Trail")
-                        or part:FindFirstChildWhichIsA("Fire")
+                    local hot = isDangerPart(part)
+                        or (distSq < 16)          -- в тебе (4 studs)
+                        or (distSq < 36 and not part.CanCollide)  -- рядом без коллизии
                     if hot then
                         local now = os.clock()
                         local lastT = lastSpawnDodge[part]
@@ -767,9 +796,17 @@ workspace.DescendantAdded:Connect(function(o)
                             state.intel.liveSignals += 1
                             local threat = analyzeThreat(part, myPos)
                             if threat then
-                                tryDodge(part, threat, { threat })
-                                processed += 1
+                                if tryDodge(part, threat, { threat }, false) then
+                                    processed += 1
+                                end
                             else
+                                -- v11: статика в spawn — сразу додж
+                                if distSq < 100 then  -- 10 studs
+                                    local staticThreat = makeStaticThreat(part, myPos)
+                                    tryDodge(part, staticThreat, { staticThreat }, "spawn")
+                                    processed += 1
+                                end
+                                -- трекаем для медленного старта
                                 if #spawnTrack < MAX_SPAWNTRACK then
                                     spawnTrack[part] = { pos = part.Position, t = now }
                                 end
@@ -783,7 +820,7 @@ workspace.DescendantAdded:Connect(function(o)
 end)
 
 --==================================================
--- HEARTBEAT (v10: минимальные аллокации)
+-- HEARTBEAT
 --==================================================
 
 local function cleanupTables(now)
@@ -794,33 +831,19 @@ local function cleanupTables(now)
         if not p.Parent or now - ts.lastDodge > 3 then threatState[p] = nil end
     end
     for p, tr in pairs(spawnTrack) do
-        if not p.Parent or now - tr.t > 0.3 then spawnTrack[p] = nil end
+        if not p.Parent or now - tr.t > SPAWNTRACK_TTL then spawnTrack[p] = nil end
     end
     for p in pairs(lastSpawnDodge) do
         if not p.Parent then lastSpawnDodge[p] = nil end
     end
 end
 
-local function evictIfBig()
-    if trackedCount > MAX_TRACKED then
-        -- evict 20 oldest
-        local count = 0
-        for p in pairs(tracked) do
-            tracked[p] = nil
-            count += 1
-            if count >= 20 then break end
-        end
-        trackedCount = 0
-    end
-end
-
 RunService.Heartbeat:Connect(function()
     local now = os.clock()
-    state.dodge._attempted = false                  -- v10: сброс флага кадра
+    state.dodge._attempted = false
 
-    -- ==== FOLLOW (изолирован от dodge) ====
+    -- ==== FOLLOW ====
     local f = state.follow
-    -- v10: не ТП-аем если под угрозой ИЛИ пауза
     if f.enabled and char and now > f._pauseUntil and not state.dodge._underThreat then
         if not f._target or not f._target.Parent then
             f._target = findPartByName(f.targetName)
@@ -871,13 +894,13 @@ RunService.Heartbeat:Connect(function()
 
     overlapParams.FilterDescendantsInstances = { char }
     local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
-    trackedCount = 0
+    trackedCount = #parts
 
-    -- v10: собираем top-3 угрозы, без аллокаций
+    -- ==== FLYING / VELOCITY THREATS ====
     local topThreats = { nil, nil, nil }
     local topScores = { 0, 0, 0 }
-    local bestThreat = nil
-    local bestScore = 0
+    local bestThreat, bestScore = nil, 0
+    local anyStaticNear = false
 
     for i = 1, #parts do
         local part = parts[i]
@@ -894,26 +917,23 @@ RunService.Heartbeat:Connect(function()
                 tr.lastSeen = now
             else
                 tracked[part] = { pos = part.Position, t = now, lastSeen = now }
-                trackedCount += 1
             end
 
             local physVel = part.AssemblyLinearVelocity
             local useVel = physVel
             if vel and vel.Magnitude > useVel.Magnitude then useVel = vel end
 
-            if useVel.Magnitude >= 5 then
+            if useVel.Magnitude >= 3 then       -- v11: было 5
                 local threat = analyzeThreat(part, myPos, useVel)
                 if threat then
                     d._underThreat = true
-                    -- scoring
                     local pri = 1
                     if threat.type == "beam" then pri = 3
-                    elseif threat.type == "named" then pri = 2 end
-                    if threat.tti < 0.5 or threat.approach > 0.3 then
+                    elseif threat.type == "named" or threat.type == "tagged" then pri = 2 end
+                    -- v11: lenient фильтр — дистанция, tti или approach
+                    if threat.tti < 0.6 or threat.approach > 0.2 or threat.dist < 20 then
                         local score = pri * 10 + (1 - math.min(threat.tti, 1))
-                        -- top-3 keep
                         if score > topScores[3] then
-                            -- сдвиг
                             if score > topScores[2] then
                                 topThreats[3] = topThreats[2]; topScores[3] = topScores[2]
                                 if score > topScores[1] then
@@ -929,9 +949,14 @@ RunService.Heartbeat:Connect(function()
                         if score > bestScore then bestThreat = threat; bestScore = score end
                     end
                 end
+            else
+                -- v11: если часть близко и опасна, но не двигается — потенциальная статика
+                if not anyStaticNear and (part.Position - myPos).Magnitude < 6.5 then
+                    if isDangerPart(part) then anyStaticNear = true end
+                end
             end
 
-            -- melee (дешёвый)
+            -- melee
             if part.Name == "HumanoidRootPart" and not bestThreat then
                 local model = part.Parent
                 if model and model ~= char then
@@ -939,14 +964,57 @@ RunService.Heartbeat:Connect(function()
                     if eHum and eHum.Health > 0 then
                         local toPlayer = myPos - part.Position
                         local dist = toPlayer.Magnitude
-                        if dist < 12 and dist > 0.1 and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
+                        if dist < 12 and dist > 0.1
+                           and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
                             local fake = {
                                 partPos = part.Position, impact = part.Position,
                                 vel = toPlayer, dist = dist, tti = 0.1,
                                 mag = 20, partSize = 4, part = part,
                             }
-                            if tryDodge(part, fake, { fake }) then break end
+                            if tryDodge(part, fake, { fake }, false) then break end
                         end
+                    end
+                end
+            end
+        end
+    end
+
+    -- ==== STATIC ZONE CHECK (v11) ====
+    if not d._attempted and now - lastStaticCheck > 0.05 then
+        lastStaticCheck = now
+        -- пробегаем ТОЛЬКО по близким частям, не по всем
+        for i = 1, #parts do
+            local part = parts[i]
+            if part ~= hrp and part.Parent then
+                local dxyz = part.Position - myPos
+                local dist = dxyz.Magnitude
+                if dist < 6.5 then
+                    if isDangerPart(part) then
+                        local ts = threatState[part]
+                        local lastT = ts and ts.lastDodge or 0
+                        if now - lastT > 0.35 then
+                            local staticThreat = makeStaticThreat(part, myPos)
+                            if tryDodge(part, staticThreat, { staticThreat }, "zone") then
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- ==== TOUCH CHECK (v11) ====
+    if not d._attempted and now - lastTouchCheck > 0.1 then
+        lastTouchCheck = now
+        local ok, touching = pcall(function() return hrp:GetTouchingParts() end)
+        if ok and touching then
+            for i = 1, #touching do
+                local tp = touching[i]
+                if tp ~= hrp and tp.Parent and isDangerPart(tp) then
+                    local staticThreat = makeStaticThreat(tp, myPos)
+                    if tryDodge(tp, staticThreat, { staticThreat }, "touch") then
+                        break
                     end
                 end
             end
@@ -957,12 +1025,12 @@ RunService.Heartbeat:Connect(function()
     for part, tr in pairs(spawnTrack) do
         if part.Parent then
             local dt = now - tr.t
-            if dt > 0.001 and dt < 0.3 then
+            if dt > 0.001 then
                 local vel = (part.Position - tr.pos) / dt
-                if vel.Magnitude >= 5 then
+                if vel.Magnitude >= 3 then
                     local threat = analyzeThreat(part, myPos, vel)
-                    if threat and threat.tti < 0.25 then
-                        if tryDodge(part, threat, { threat }) then break end
+                    if threat and (threat.tti < 0.4 or threat.dist < 20) then
+                        if tryDodge(part, threat, { threat }, false) then break end
                     end
                 end
             end
@@ -972,10 +1040,9 @@ RunService.Heartbeat:Connect(function()
     -- primary
     if bestThreat and not d._attempted then
         state.intel.liveSignals += 1
-        -- фильтруем nil из topThreats
         local list = {}
         for i = 1, 3 do if topThreats[i] then list[#list+1] = topThreats[i] end end
-        tryDodge(bestThreat.part, bestThreat, list)
+        tryDodge(bestThreat.part, bestThreat, list, false)
     end
 
     if not d._underThreat then d._underThreat = (bestThreat ~= nil) end
@@ -984,8 +1051,8 @@ RunService.Heartbeat:Connect(function()
     if now - trackLastCleanup > 0.8 then
         trackLastCleanup = now
         cleanupTables(now)
-        evictIfBig()
-        perfLabel.Text = string.format("FPS-нагрузка: OK · tracked: %d", trackedCount)
+        perfLabel.Text = string.format("tracked: %d · threats: %d", trackedCount,
+            #topThreats + (anyStaticNear and 1 or 0))
     end
 end)
 
@@ -1173,7 +1240,7 @@ closeBtn.Activated:Connect(function() frame.Visible = false; reopenBtn.Visible =
 reopenBtn.Activated:Connect(function() frame.Visible = true; reopenBtn.Visible = false end)
 
 --==================================================
--- KEYBINDS + INIT
+-- INIT
 --==================================================
 
 UIS.InputBegan:Connect(function(input, processed)
@@ -1187,4 +1254,4 @@ end)
 
 switchTab("parts"); scanWorkspace(); refreshPartList(); dodgeStats.Text = getStatsText()
 
-print("[FNVB] v10 loaded OK — stable dodge")
+print("[FNVB] v11 loaded OK — static + touch + tag detection")
