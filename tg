@@ -1,15 +1,33 @@
--- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio (LocalScript in StarterPlayerScripts)
--- Part browser + TP · attack auto-dodge · persistent follow-TP. All client-side.
+-- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
+-- v3: 5-layer attack detection (delta/velocity/spawn/health/remote) + script scanner
+-- Optimization: single Heartbeat loop, batched spawn scan, cached character, tracked-part expiry
 
-print("[FNVB] loading...")
+print("[FNVB] loading v3...")
 
-local Players    = game:GetService("Players")
-local UIS        = game:GetService("UserInputService")
-local RunService = game:GetService("RunService")
+local Players, UIS, RunService, RS =
+    game:GetService("Players"), game:GetService("UserInputService"),
+    game:GetService("RunService"), game:GetService("ReplicatedStorage")
 
 local player = Players.LocalPlayer
 if not player then return end
 local playerGui = player:WaitForChild("PlayerGui")
+
+--==================================================
+-- ATTACK VOCAB
+--==================================================
+
+local ATK_KEYS = {
+    "attack","damage","hit","punch","swing","slash","shoot","shot","aim",
+    "fire","explode","bomb","projectile","bullet","beam","melee","stab",
+    "strike","kill","hurt","weapon","sword","blast","pierce","lunge"
+}
+local function nameIsAttack(name)
+    local n = string.lower(name)
+    for i = 1, #ATK_KEYS do
+        if string.find(n, ATK_KEYS[i], 1, true) then return true end
+    end
+    return false
+end
 
 --==================================================
 -- STATE
@@ -18,59 +36,84 @@ local playerGui = player:WaitForChild("PlayerGui")
 local state = {
     dodge = {
         enabled       = false,
-        velocityMin   = 40,      -- минимальная скорость "снаряда"
-        approachDot   = 0.55,    -- dot(vel_unit, to_me_unit) — насколько "в нас"
-        reactRadius   = 45,      -- studs, реагировать только в этом радиусе
-        dodgeDist     = 12,      -- на сколько отпрыгнуть перпендикулярно
-        cooldown      = 0.25,    -- сек между доджами
-        verticalBias  = 0.15,    -- небольшой прыжок вверх для надёжности
+        velocityMin   = 15,       -- v3: спущено с 40 — ловим медленные снаряды
+        approachDot   = 0.30,     -- v3: спущено с 0.55 — «к тебе» мягче
+        reactRadius   = 50,
+        dodgeDist     = 13,
+        cooldown      = 0.25,
+        urgentCD      = 0.10,     -- v3: короткий кулдаун для срочных
+        verticalBias  = 0.15,
+        spawnRadius   = 12,       -- v3: любая часть в этом радиусе = триггер
         _lastDodge    = 0,
         _lastHealth   = nil,
+        _dodges       = 0,
+        _dodgesUrgent = 0,
     },
     follow = {
-        enabled   = false,
-        targetName = "",         -- имя части, к которой ТП-имся постоянно
-        offset     = Vector3.new(0, 5, 0),
-        _target    = nil,
+        enabled = false, targetName = "",
+        offset = Vector3.new(0, 5, 0),
+        _target = nil, _lastPos = nil,
     },
     parts = {
-        filter     = "",         -- поиск по имени
-        showAnchoredOnly = false,
-        maxList    = 200,
-        _list      = {},         -- BasePart[]
+        filter = "", showAnchoredOnly = false, maxList = 200, _list = {},
+    },
+    intel = {
+        suspiciousRemotes = {},   -- [name] = true
+        suspiciousScripts = {},   -- [path] = true
+        liveSignals       = 0,
     },
 }
 
 --==================================================
--- GUI HELPERS (FK1 style, симметрично FNV)
+-- CACHED CHARACTER
+--==================================================
+
+local char, hrp, hum = nil, nil, nil
+local function updateChar(c)
+    char = c
+    hrp, hum = nil, nil
+    if c then
+        hrp = c:FindFirstChild("HumanoidRootPart")
+        hum = c:FindFirstChildOfClass("Humanoid")
+        if not hrp then hrp = c:WaitForChild("HumanoidRootPart", 5) end
+        if not hum then hum = c:WaitForChild("Humanoid", 5) end
+        if hum then state.dodge._lastHealth = hum.Health end
+    end
+end
+player.CharacterAdded:Connect(updateChar)
+player.CharacterRemoving:Connect(function() char, hrp, hum = nil, nil, nil end)
+if player.Character then updateChar(player.Character) end
+
+--==================================================
+-- UI HELPERS
 --==================================================
 
 local function corner(p, r)
-    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 5); c.Parent = p; return c
+    local c = Instance.new("UICorner"); c.CornerRadius = UDim.new(0, r or 4); c.Parent = p
 end
 local function mkBtn(parent, text, pos, size, bg, font, ts)
     local b = Instance.new("TextButton")
     b.Position = pos or UDim2.fromOffset(0, 0); b.Size = size
     b.BackgroundColor3 = bg or Color3.fromRGB(120, 25, 45)
-    b.BorderSizePixel = 0; b.Text = text
-    b.TextColor3 = Color3.new(1,1,1); b.TextScaled = (ts == nil)
-    b.Font = font or Enum.Font.GothamBold; b.AutoButtonColor = true
-    b.Parent = parent; corner(b, 5); if ts then b.TextSize = ts end
+    b.BorderSizePixel = 0; b.Text = text; b.TextColor3 = Color3.new(1, 1, 1)
+    b.TextScaled = (ts == nil); b.Font = font or Enum.Font.GothamBold
+    b.AutoButtonColor = true; b.Parent = parent; corner(b, 4)
+    if ts then b.TextSize = ts end
     return b
 end
 local function mkLabel(parent, text, pos, size, align)
     local t = Instance.new("TextLabel")
-    t.Position = pos; t.Size = size; t.BackgroundTransparency = 1
-    t.Text = text; t.TextColor3 = Color3.fromRGB(230,230,230)
-    t.TextScaled = true; t.TextXAlignment = align or Enum.TextXAlignment.Left
+    t.Position = pos; t.Size = size; t.BackgroundTransparency = 1; t.Text = text
+    t.TextColor3 = Color3.fromRGB(230, 230, 230); t.TextScaled = true
+    t.TextXAlignment = align or Enum.TextXAlignment.Left
     t.Font = Enum.Font.Gotham; t.Parent = parent; return t
 end
 local function mkToggle(parent, text, pos, size, getter, setter)
-    local b = mkBtn(parent, "", pos, size, Color3.fromRGB(48,48,60), Enum.Font.Gotham)
+    local b = mkBtn(parent, "", pos, size, Color3.fromRGB(48, 48, 60), Enum.Font.Gotham)
     local function refresh()
         local on = getter()
         b.Text = (on and "✓ " or "○ ") .. text
-        b.BackgroundColor3 = on and Color3.fromRGB(35,115,65) or Color3.fromRGB(48,48,60)
+        b.BackgroundColor3 = on and Color3.fromRGB(35, 115, 65) or Color3.fromRGB(48, 48, 60)
     end
     b.Activated:Connect(function() setter(not getter()); refresh() end)
     refresh(); return b
@@ -86,31 +129,31 @@ gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 50; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(360, 460)
+frame.Size = UDim2.fromOffset(280, 380)
 frame.Position = UDim2.new(0, 20, 0.08, 0)
-frame.BackgroundColor3 = Color3.fromRGB(18,18,25)
+frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
 frame.BorderSizePixel = 0; frame.Active = true
 frame.ClipsDescendants = true; frame.Parent = gui
-corner(frame, 10)
+corner(frame, 8)
 
 local outline = Instance.new("UIStroke")
-outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 2; outline.Parent = frame
+outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Parent = frame
 
--- HEADER
 local header = Instance.new("Frame")
-header.Size = UDim2.new(1, 0, 0, 32); header.BackgroundTransparency = 1; header.Parent = frame
+header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
 
-local dragBar = mkBtn(header, "FNV BUILDER",
-    UDim2.fromOffset(6, 0), UDim2.new(0, 160, 1, 0), Color3.fromRGB(0,0,0))
+local dragBar = mkBtn(header, "FNVB3",
+    UDim2.fromOffset(6, 0), UDim2.new(0, 50, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1
 dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
 dragBar.TextXAlignment = Enum.TextXAlignment.Left
+dragBar.TextSize = 12
 
 local tabBar = Instance.new("Frame")
-tabBar.Position = UDim2.fromOffset(170, 5)
-tabBar.Size = UDim2.new(1, -200, 0, 22); tabBar.BackgroundTransparency = 1; tabBar.Parent = header
+tabBar.Position = UDim2.fromOffset(58, 4)
+tabBar.Size = UDim2.new(1, -88, 0, 18); tabBar.BackgroundTransparency = 1; tabBar.Parent = header
 local tl = Instance.new("UIListLayout")
-tl.FillDirection = Enum.FillDirection.Horizontal; tl.Padding = UDim.new(0, 3); tl.Parent = tabBar
+tl.FillDirection = Enum.FillDirection.Horizontal; tl.Padding = UDim.new(0, 2); tl.Parent = tabBar
 
 local tabs, panels = {}, {}
 local activeTab = "parts"
@@ -120,14 +163,14 @@ local function switchTab(name)
     for tn, p in pairs(panels) do p.Visible = (tn == name) end
     for tn, b in pairs(tabs) do
         local on = (tn == name)
-        b.BackgroundColor3 = on and Color3.fromRGB(120,25,45) or Color3.fromRGB(40,40,52)
-        b.TextColor3 = on and Color3.new(1,1,1) or Color3.fromRGB(180,180,190)
+        b.BackgroundColor3 = on and Color3.fromRGB(120, 25, 45) or Color3.fromRGB(40, 40, 52)
+        b.TextColor3 = on and Color3.new(1, 1, 1) or Color3.fromRGB(180, 180, 190)
     end
 end
 
 local function makeTab(text, key)
-    local b = mkBtn(tabBar, text, nil, UDim2.new(1/3, -2, 1, 0), Color3.fromRGB(40,40,52))
-    b.TextColor3 = Color3.fromRGB(180,180,190)
+    local b = mkBtn(tabBar, text, nil, UDim2.new(1/3, -2, 1, 0), Color3.fromRGB(40, 40, 52))
+    b.TextColor3 = Color3.fromRGB(180, 180, 190); b.TextSize = 10
     b.Activated:Connect(function() switchTab(key) end)
     tabs[key] = b
 end
@@ -136,22 +179,20 @@ makeTab("DODGE", "dodge")
 makeTab("FOLLOW", "follow")
 
 local closeBtn = mkBtn(header, "✕",
-    UDim2.new(1, -26, 0, 6), UDim2.fromOffset(20, 20),
-    Color3.fromRGB(80,20,30)); closeBtn.ZIndex = 5
+    UDim2.new(1, -22, 0, 4), UDim2.fromOffset(18, 18),
+    Color3.fromRGB(80, 20, 30)); closeBtn.TextSize = 12; closeBtn.ZIndex = 5
 
--- CONTENT
 local content = Instance.new("ScrollingFrame")
-content.Position = UDim2.fromOffset(0, 32)
-content.Size = UDim2.new(1, 0, 1, -32)
+content.Position = UDim2.fromOffset(0, 26)
+content.Size = UDim2.new(1, 0, 1, -26)
 content.BackgroundTransparency = 1; content.BorderSizePixel = 0
-content.ScrollBarThickness = 3
-content.ScrollBarImageColor3 = Color3.fromRGB(120,25,45)
+content.ScrollBarThickness = 2; content.ScrollBarImageColor3 = Color3.fromRGB(120, 25, 45)
 content.CanvasSize = UDim2.new(); content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.ClipsDescendants = true; content.Parent = frame
 
 local cp = Instance.new("UIPadding")
-cp.PaddingTop = UDim.new(0, 4); cp.PaddingLeft = UDim.new(0, 7)
-cp.PaddingRight = UDim.new(0, 7); cp.PaddingBottom = UDim.new(0, 6); cp.Parent = content
+cp.PaddingTop = UDim.new(0, 3); cp.PaddingLeft = UDim.new(0, 5)
+cp.PaddingRight = UDim.new(0, 5); cp.PaddingBottom = UDim.new(0, 4); cp.Parent = content
 
 local function makePanel(key, height)
     local p = Instance.new("Frame")
@@ -164,76 +205,61 @@ end
 -- PARTS PANEL
 --==================================================
 
-local panelParts = makePanel("parts", 400)
+local panelParts = makePanel("parts", 340)
 
 local searchBox = Instance.new("TextBox")
-searchBox.Position = UDim2.fromOffset(0, 0)
-searchBox.Size = UDim2.new(1, 0, 0, 24)
-searchBox.BackgroundColor3 = Color3.fromRGB(38,38,48)
-searchBox.BorderSizePixel = 0; searchBox.Text = ""
-searchBox.PlaceholderText = "Поиск по имени части..."
-searchBox.PlaceholderColor3 = Color3.fromRGB(170,170,180)
-searchBox.TextColor3 = Color3.new(1,1,1); searchBox.TextScaled = true
+searchBox.Position = UDim2.fromOffset(0, 0); searchBox.Size = UDim2.new(1, 0, 0, 20)
+searchBox.BackgroundColor3 = Color3.fromRGB(38, 38, 48); searchBox.BorderSizePixel = 0
+searchBox.Text = ""; searchBox.PlaceholderText = "поиск по имени..."
+searchBox.PlaceholderColor3 = Color3.fromRGB(170, 170, 180)
+searchBox.TextColor3 = Color3.new(1, 1, 1); searchBox.TextScaled = true
 searchBox.ClearTextOnFocus = false; searchBox.Parent = panelParts
-corner(searchBox, 5)
+corner(searchBox, 4)
 
-mkToggle(panelParts, "Только Anchored", UDim2.fromOffset(0, 28),
-    UDim2.new(1, 0, 0, 22),
+mkToggle(panelParts, "Только Anchored", UDim2.fromOffset(0, 24),
+    UDim2.new(1, 0, 0, 18),
     function() return state.parts.showAnchoredOnly end,
-    function(v) state.parts.showAnchoredOnly = v; refreshPartList() end)
+    function(v) state.parts.showAnchoredOnly = v; scanWorkspace(); refreshPartList() end)
 
-local scanBtn = mkBtn(panelParts, "СКАНИРОВАТЬ WORKSPACE",
-    UDim2.fromOffset(0, 54), UDim2.new(1, 0, 0, 22))
+local scanBtn = mkBtn(panelParts, "СКАН WORKSPACE",
+    UDim2.fromOffset(0, 46), UDim2.new(1, 0, 0, 18)); scanBtn.TextSize = 10
 
 local statusLabel = mkLabel(panelParts, "0 частей",
-    UDim2.fromOffset(0, 80), UDim2.new(1, 0, 0, 14))
-statusLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
+    UDim2.fromOffset(0, 68), UDim2.new(1, 0, 0, 12))
+statusLabel.TextColor3 = Color3.fromRGB(255, 200, 80); statusLabel.TextSize = 10
 
 local partList = Instance.new("ScrollingFrame")
-partList.Position = UDim2.fromOffset(0, 98)
-partList.Size = UDim2.new(1, 0, 0, 290)
-partList.BackgroundColor3 = Color3.fromRGB(28,28,37)
-partList.BorderSizePixel = 0; partList.ScrollBarThickness = 3
+partList.Position = UDim2.fromOffset(0, 84); partList.Size = UDim2.new(1, 0, 0, 252)
+partList.BackgroundColor3 = Color3.fromRGB(28, 28, 37); partList.BorderSizePixel = 0
+partList.ScrollBarThickness = 2
 partList.CanvasSize = UDim2.new(); partList.AutomaticCanvasSize = Enum.AutomaticSize.Y
-partList.Parent = panelParts
-corner(partList, 5)
+partList.Parent = panelParts; corner(partList, 4)
 
 local ll = Instance.new("UIListLayout")
-ll.Padding = UDim.new(0, 3); ll.SortOrder = Enum.SortOrder.LayoutOrder
-ll.Parent = partList
+ll.Padding = UDim.new(0, 2); ll.SortOrder = Enum.SortOrder.LayoutOrder; ll.Parent = partList
 local lp = Instance.new("UIPadding")
-lp.PaddingTop = UDim.new(0, 4); lp.PaddingLeft = UDim.new(0, 3)
-lp.PaddingRight = UDim.new(0, 3); lp.PaddingBottom = UDim.new(0, 4); lp.Parent = partList
-
-local function isPart(o)
-    return o:IsA("BasePart") and not o:IsDescendantOf(player.Character or workspace)
-end
+lp.PaddingTop = UDim.new(0, 3); lp.PaddingLeft = UDim.new(0, 2)
+lp.PaddingRight = UDim.new(0, 2); lp.PaddingBottom = UDim.new(0, 3); lp.Parent = partList
 
 local function teleportTo(part)
-    if not part or not part.Parent then return end
-    local ch = player.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
+    if not part or not part.Parent or not char then return end
     local ok = pcall(function()
-        ch:PivotTo(CFrame.new(part.Position + Vector3.new(0, 5, 0)))
+        char:PivotTo(CFrame.new(part.Position + Vector3.new(0, 5, 0)))
     end)
     statusLabel.Text = ok and ("ТП → " .. part.Name) or "TP провален"
 end
 
-local function scanWorkspace()
-    local list, seen = {}, {}
+function scanWorkspace()
+    local list = {}
     local max = state.parts.maxList
     local q = string.lower(state.parts.filter)
+    local c = player.Character
     for _, obj in ipairs(workspace:GetDescendants()) do
         if #list >= max then break end
-        if isPart(obj) and not seen[obj] then
-            if state.parts.showAnchoredOnly and not obj.Anchored then
-                -- skip
-            else
-                local n = string.lower(obj.Name)
-                if q == "" or string.find(n, q, 1, true) then
-                    seen[obj] = true
-                    table.insert(list, obj)
+        if obj:IsA("BasePart") and not (c and obj:IsDescendantOf(c)) then
+            if not state.parts.showAnchoredOnly or obj.Anchored then
+                if q == "" or string.find(string.lower(obj.Name), q, 1, true) then
+                    list[#list + 1] = obj
                 end
             end
         end
@@ -246,24 +272,21 @@ function refreshPartList()
     for _, c in ipairs(partList:GetChildren()) do
         if c:IsA("Frame") then c:Destroy() end
     end
-    local list = state.parts._list
-    for i, part in ipairs(list) do
+    for i, part in ipairs(state.parts._list) do
         local row = Instance.new("Frame")
-        row.LayoutOrder = i; row.Size = UDim2.new(1, -4, 0, 24)
+        row.LayoutOrder = i; row.Size = UDim2.new(1, -2, 0, 20)
         row.BackgroundTransparency = 1; row.Parent = partList
 
-        local nb = mkBtn(row, part.Name .. " [" .. part.ClassName .. "]",
-            UDim2.fromOffset(0, 0), UDim2.new(1, -56, 0, 22),
-            Color3.fromRGB(48,48,60), Enum.Font.Gotham)
-        nb.TextSize = 11
-        nb.TextXAlignment = Enum.TextXAlignment.Left
+        local nb = mkBtn(row, part.Name,
+            UDim2.fromOffset(0, 0), UDim2.new(1, -34, 0, 20),
+            Color3.fromRGB(48, 48, 60), Enum.Font.Gotham)
+        nb.TextSize = 10; nb.TextXAlignment = Enum.TextXAlignment.Left
         nb.TextTruncate = Enum.TextTruncate.AtEnd
         nb.Activated:Connect(function() teleportTo(part) end)
 
         local tpBtn = mkBtn(row, "ТП",
-            UDim2.new(1, -52, 0, 0), UDim2.fromOffset(48, 22),
-            Color3.fromRGB(120,25,45), Enum.Font.GothamBold)
-        tpBtn.TextSize = 11
+            UDim2.new(1, -32, 0, 0), UDim2.fromOffset(30, 20),
+            Color3.fromRGB(120, 25, 45)); tpBtn.TextSize = 10
         tpBtn.Activated:Connect(function() teleportTo(part) end)
     end
 end
@@ -274,210 +297,437 @@ searchBox:GetPropertyChangedSignal("Text"):Connect(function()
 end)
 scanBtn.Activated:Connect(function() scanWorkspace(); refreshPartList() end)
 
+local rescanQueued = false
+workspace.DescendantAdded:Connect(function(o)
+    if not o:IsA("BasePart") or rescanQueued then return end
+    rescanQueued = true
+    task.delay(0.6, function()
+        rescanQueued = false
+        if activeTab == "parts" then scanWorkspace(); refreshPartList() end
+    end)
+end)
+
 --==================================================
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 320)
+local panelDodge = makePanel("dodge", 560)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ", UDim2.fromOffset(0, 0),
-    UDim2.new(1, 0, 0, 26),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v3", UDim2.fromOffset(0, 0),
+    UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
 
-mkLabel(panelDodge, "Радиус реакции (studs):",
-    UDim2.fromOffset(0, 34), UDim2.new(1, 0, 0, 14))
-local radiusLabel = mkLabel(panelDodge, tostring(state.dodge.reactRadius),
-    UDim2.fromOffset(0, 50), UDim2.new(1, -60, 0, 20))
-radiusLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
-mkBtn(panelDodge, "−", UDim2.new(1, -56, 0, 50),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.reactRadius = math.max(10, state.dodge.reactRadius - 5)
-        radiusLabel.Text = tostring(state.dodge.reactRadius)
-    end)
-mkBtn(panelDodge, "+", UDim2.new(1, -28, 0, 50),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.reactRadius = math.min(200, state.dodge.reactRadius + 5)
-        radiusLabel.Text = tostring(state.dodge.reactRadius)
-    end)
+local function stepper(parent, y, labelText, getter, setter, min, max, step, fmt)
+    mkLabel(parent, labelText, UDim2.fromOffset(0, y), UDim2.new(1, 0, 0, 12)).TextSize = 10
+    fmt = fmt or tostring
+    local val = mkLabel(parent, fmt(getter()),
+        UDim2.fromOffset(0, y + 14), UDim2.new(1, -50, 0, 18))
+    val.TextColor3 = Color3.fromRGB(255, 200, 80); val.TextSize = 10
+    mkBtn(parent, "−", UDim2.new(1, -46, 0, y + 14), UDim2.fromOffset(22, 18))
+        .Activated:Connect(function()
+            setter(math.max(min, getter() - step)); val.Text = fmt(getter())
+        end)
+    mkBtn(parent, "+", UDim2.new(1, -22, 0, y + 14), UDim2.fromOffset(22, 18))
+        .Activated:Connect(function()
+            setter(math.min(max, getter() + step)); val.Text = fmt(getter())
+        end)
+    return val
+end
 
-mkLabel(panelDodge, "Дистанция уклонения (studs):",
-    UDim2.fromOffset(0, 78), UDim2.new(1, 0, 0, 14))
-local ddLabel = mkLabel(panelDodge, tostring(state.dodge.dodgeDist),
-    UDim2.fromOffset(0, 94), UDim2.new(1, -60, 0, 20))
-ddLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
-mkBtn(panelDodge, "−", UDim2.new(1, -56, 0, 94),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.dodgeDist = math.max(3, state.dodge.dodgeDist - 2)
-        ddLabel.Text = tostring(state.dodge.dodgeDist)
-    end)
-mkBtn(panelDodge, "+", UDim2.new(1, -28, 0, 94),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.dodgeDist = math.min(50, state.dodge.dodgeDist + 2)
-        ddLabel.Text = tostring(state.dodge.dodgeDist)
-    end)
+stepper(panelDodge, 26, "Радиус детекта (studs):",
+    function() return state.dodge.reactRadius end,
+    function(v) state.dodge.reactRadius = v end, 10, 200, 5)
 
-mkLabel(panelDodge, "Мин. скорость снаряда:",
-    UDim2.fromOffset(0, 122), UDim2.new(1, 0, 0, 14))
-local velLabel = mkLabel(panelDodge, tostring(state.dodge.velocityMin),
-    UDim2.fromOffset(0, 138), UDim2.new(1, -60, 0, 20))
-velLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
-mkBtn(panelDodge, "−", UDim2.new(1, -56, 0, 138),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.velocityMin = math.max(5, state.dodge.velocityMin - 10)
-        velLabel.Text = tostring(state.dodge.velocityMin)
-    end)
-mkBtn(panelDodge, "+", UDim2.new(1, -28, 0, 138),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.dodge.velocityMin = math.min(500, state.dodge.velocityMin + 10)
-        velLabel.Text = tostring(state.dodge.velocityMin)
-    end)
+stepper(panelDodge, 62, "Радиус spawn-радара:",
+    function() return state.dodge.spawnRadius end,
+    function(v) state.dodge.spawnRadius = v end, 3, 40, 1)
 
-local dodgeStats = mkLabel(panelDodge, "уклонений: 0 · снарядов: 0",
-    UDim2.fromOffset(0, 170), UDim2.new(1, 0, 0, 16))
-dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180)
+stepper(panelDodge, 98, "Дистанция рывка:",
+    function() return state.dodge.dodgeDist end,
+    function(v) state.dodge.dodgeDist = v end, 3, 60, 2)
 
-mkLabel(panelDodge, "Логика: смотрит все BasePart в workspace с AssemblyLinearVelocity — если скорость > min, направлена к игроку (dot > "..state.dodge.approachDot.."), в радиусе — телепортирует перпендикулярно вектору полёта. Плюс страховка через Humanoid.Health: получил урон → мгновенный рывок в сторону.",
-    UDim2.fromOffset(0, 196), UDim2.new(1, 0, 0, 110)).TextSize = 10
-panels.dodge:FindFirstChildOfClass("TextLabel"):FindFirstChildWhichIsA("TextLabel") -- no-op
+stepper(panelDodge, 134, "Мин. скорость (studs/s):",
+    function() return state.dodge.velocityMin end,
+    function(v) state.dodge.velocityMin = v end, 1, 300, 5)
 
---==============================
--- DODGE LOGIC
---==============================
+stepper(panelDodge, 170, "Порог подлёта (0-100):",
+    function() return math.floor(state.dodge.approachDot * 100) end,
+    function(v) state.dodge.approachDot = v / 100 end, 0, 100, 5,
+    function(v) return tostring(v) .. "%" end)
 
-local dodgeStats_counter = { dodges = 0, projectiles = 0 }
+local dodgeStats = mkLabel(panelDodge, "рывков: 0 · срочных: 0 · сигналов: 0",
+    UDim2.fromOffset(0, 208), UDim2.new(1, 0, 0, 14))
+dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
-local function doDodge(perp)
+-- INTEL SECTION
+mkLabel(panelDodge, "— INTEL —",
+    UDim2.fromOffset(0, 228), UDim2.new(1, 0, 0, 12),
+    Enum.TextXAlignment.Center).TextColor3 = Color3.fromRGB(255, 100, 130)
+
+local intelStatus = mkLabel(panelDodge, "не сканировано",
+    UDim2.fromOffset(0, 242), UDim2.new(1, 0, 0, 14))
+intelStatus.TextColor3 = Color3.fromRGB(150, 200, 255); intelStatus.TextSize = 10
+
+local intelList = Instance.new("Frame")
+intelList.Position = UDim2.fromOffset(0, 260); intelList.Size = UDim2.new(1, 0, 0, 180)
+intelList.BackgroundColor3 = Color3.fromRGB(28, 28, 37); intelList.BorderSizePixel = 0
+intelList.Parent = panelDodge; corner(intelList, 4)
+
+local intelScroll = Instance.new("ScrollingFrame")
+intelScroll.Size = UDim2.new(1, -4, 1, -4); intelScroll.Position = UDim2.fromOffset(2, 2)
+intelScroll.BackgroundTransparency = 1; intelScroll.BorderSizePixel = 0
+intelScroll.ScrollBarThickness = 2; intelScroll.CanvasSize = UDim2.new()
+intelScroll.AutomaticCanvasSize = Enum.AutomaticSize.Y
+intelScroll.Parent = intelList
+
+local intelLL = Instance.new("UIListLayout")
+intelLL.Padding = UDim.new(0, 1); intelLL.SortOrder = Enum.SortOrder.LayoutOrder
+intelLL.Parent = intelScroll
+
+local scanScriptsBtn = mkBtn(panelDodge, "СКАНИРОВАТЬ СКРИПТЫ + РЕМОУТЫ",
+    UDim2.fromOffset(0, 446), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
+
+mkLabel(panelDodge,
+    "Клиент может прочитать ТОЛЬКО LocalScript/ModuleScript, что к нему долетели. Server Script .Source недоступен — это защита движка, не обходится. Зато: remote-имена + spawn-детект ловят атаки лучше любого чтения.",
+    UDim2.fromOffset(0, 470), UDim2.new(1, 0, 0, 84)).TextSize = 9
+
+--==================================================
+-- DODGE ENGINE — 5 LAYERS
+--==================================================
+
+local overlapParams = OverlapParams.new()
+overlapParams.FilterType = Enum.RaycastFilterType.Exclude
+overlapParams.MaxParts = 50
+
+local tracked = {}       -- [part] = {pos, t, lastSeen}
+local trackLastCleanup = 0
+local TRACK_TTL = 0.6
+
+local pendingSpawn = {}
+local spawnCheckQueued = false
+local lastDodgePerPart = {}   -- [part] = time, чтобы не спамить
+
+local function getStatsText()
+    local d = state.dodge
+    return string.format("рывков: %d · срочных: %d · сигналов: %d",
+        d._dodges, d._dodgesUrgent, state.intel.liveSignals)
+end
+
+local function doDodge(perp, urgent, sourcePos)
     local d = state.dodge
     local now = os.clock()
-    if now - d._lastDodge < d.cooldown then return end
-    local ch = player.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
+    local cd = urgent and d.urgentCD or d.cooldown
+    if now - d._lastDodge < cd then return end
+    if not char or not hrp then return end
     d._lastDodge = now
-    dodgeStats_counter.dodges += 1
-    dodgeStats.Text = string.format("уклонений: %d · снарядов: %d",
-        dodgeStats_counter.dodges, dodgeStats_counter.projectiles)
-    local dropPoint = hrp.Position + perp * d.dodgeDist
+    if urgent then d._dodgesUrgent += 1 else d._dodges += 1 end
+    dodgeStats.Text = getStatsText()
+    local dest = hrp.Position + perp * d.dodgeDist
         + Vector3.new(0, d.verticalBias * d.dodgeDist, 0)
-    pcall(function() ch:PivotTo(CFrame.new(dropPoint)) end)
+    pcall(function() char:PivotTo(CFrame.new(dest)) end)
 end
 
-local function computeDodgeVector(part, myPos)
-    local vel = part.AssemblyLinearVelocity
-    if vel.Magnitude < 1 then return nil end
-    local toMe = (myPos - part.Position)
-    local dist = toMe.Magnitude
-    if dist < 0.5 then return nil end
-    local approach = vel.Unit:Dot(toMe.Unit)
-    if approach < state.dodge.approachDot then return nil end
-    -- горизонтальный перпендикуляр к вектору полёта
-    local v = vel.Unit
-    local perp = Vector3.new(-v.Z, 0, v.X)
-    if perp.Magnitude < 0.1 then perp = Vector3.new(1, 0, 0) end
-    perp = perp.Unit
-    -- выбираем сторону, дальше от снаряда, чтобы не пересечь его траекторию
-    local left  = myPos + perp * state.dodge.dodgeDist
-    local right = myPos - perp * state.dodge.dodgeDist
-    local dLeft  = (left  - part.Position).Magnitude
-    local dRight = (right - part.Position).Magnitude
-    return dLeft > dRight and perp or -perp
+-- выбор направления: перпендикулярно + от источника
+local function pickDodgeDir(myPos, sourcePos, velDir)
+    local away
+    if sourcePos then
+        away = (myPos - sourcePos)
+    else
+        away = Vector3.new(math.random() - 0.5, 0, math.random() - 0.5)
+    end
+    away = Vector3.new(away.X, 0, away.Z)
+    if away.Magnitude < 0.1 then away = Vector3.new(1, 0, 0) end
+    away = away.Unit
+    -- перпендикуляр если есть скорость снаряда
+    if velDir and velDir.Magnitude > 0.1 then
+        local v = velDir.Unit
+        local perp = Vector3.new(-v.Z, 0, v.X)
+        if perp.Magnitude < 0.1 then perp = Vector3.new(1, 0, 0) end
+        perp = perp.Unit
+        -- в сторону away
+        if perp:Dot(away) < 0 then perp = -perp end
+        return perp
+    end
+    return away
 end
 
+-- LAYER 3: spawn detector — batched
+workspace.DescendantAdded:Connect(function(o)
+    if not state.dodge.enabled then return end
+    if not o:IsA("BasePart") then return end
+    pendingSpawn[#pendingSpawn + 1] = o
+    if spawnCheckQueued then return end
+    spawnCheckQueued = true
+    task.defer(function()
+        spawnCheckQueued = false
+        local list = pendingSpawn
+        pendingSpawn = {}
+        if not hrp then return end
+        local myPos = hrp.Position
+        local d = state.dodge
+        for _, part in ipairs(list) do
+            if part.Parent then
+                local dist = (part.Position - myPos).Magnitude
+                if dist <= d.spawnRadius then
+                    -- классификация: опасен ли этот spawn
+                    local hot, reason = false, nil
+                    if dist < 3 then hot, reason = true, "on-you" end
+                    if not hot and nameIsAttack(part.Name) then hot, reason = true, "name" end
+                    if not hot and part:FindFirstChildWhichIsA("ParticleEmitter") then
+                        hot, reason = true, "vfx" end
+                    if not hot and (part:FindFirstChildWhichIsA("Beam")
+                        or part:FindFirstChildWhichIsA("Trail")) then
+                        hot, reason = true, "beam" end
+                    if not hot and part:FindFirstChildWhichIsA("Fire") then
+                        hot, reason = true, "fire" end
+                    if not hot and part.Size.Magnitude < 6 and not part.Anchored then
+                        hot, reason = true, "small-dynamic" end
+                    if hot then
+                        local now = os.clock()
+                        local lastT = lastDodgePerPart[part] or 0
+                        if now - lastT > 0.2 then
+                            lastDodgePerPart[part] = now
+                            state.intel.liveSignals += 1
+                            doDodge(pickDodgeDir(myPos, part.Position,
+                                part.AssemblyLinearVelocity), true, part.Position)
+                        end
+                    end
+                    -- всегда начинаем трекинг
+                    tracked[part] = { pos = part.Position, t = os.clock(), lastSeen = os.clock() }
+                end
+            end
+        end
+        dodgeStats.Text = getStatsText()
+    end)
+end)
+
+-- LAYERS 1+2: velocity + delta — single Heartbeat
 RunService.Heartbeat:Connect(function()
     local d = state.dodge
-    if not d.enabled then return end
-    local ch = player.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    local hum = ch and ch:FindFirstChildOfClass("Humanoid")
-    if not hrp or not hum or hum.Health <= 0 then return end
+    if not d.enabled or not hrp or not hum or hum.Health <= 0 then return end
+    local now = os.clock()
+    local myPos = hrp.Position
 
-    -- 1) страховка через Health
+    -- LAYER 4: health fallback
     if d._lastHealth and hum.Health < d._lastHealth - 0.01 then
-        dodgeStats_counter.projectiles += 1
-        local angle = math.random() * math.pi * 2
-        doDodge(Vector3.new(math.cos(angle), 0, math.sin(angle)))
+        state.intel.liveSignals += 1
+        local a = math.random() * math.pi * 2
+        doDodge(Vector3.new(math.cos(a), 0, math.sin(a)), true, nil)
     end
     d._lastHealth = hum.Health
 
-    -- 2) детект снарядов по velocity
-    local myPos = hrp.Position
-    for _, part in ipairs(workspace:GetDescendants()) do
-        if part:IsA("BasePart")
-           and not part:IsDescendantOf(ch)
-           and part.AssemblyLinearVelocity.Magnitude >= d.velocityMin then
-            local dist = (part.Position - myPos).Magnitude
-            if dist <= d.reactRadius then
-                local perp = computeDodgeVector(part, myPos)
-                if perp then
-                    dodgeStats_counter.projectiles += 1
-                    doDodge(perp)
-                    break  -- одного доджа за кадр достаточно
+    -- radius scan
+    overlapParams.FilterDescendantsInstances = { char }
+    local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
+
+    for _, part in ipairs(parts) do
+        if part ~= hrp then
+            local tr = tracked[part]
+            local velFromDelta
+
+            -- LAYER 2: delta (anchored CFramed детект)
+            if tr then
+                local dt = now - tr.t
+                if dt > 0.001 then
+                    velFromDelta = (part.Position - tr.pos) / dt
                 end
             end
+            tracked[part] = { pos = part.Position, t = now, lastSeen = now }
+
+            -- LAYER 1: physics velocity
+            local physVel = part.AssemblyLinearVelocity
+
+            -- выбираем лучший сигнал
+            local bestVel, bestMag = nil, 0
+            if velFromDelta then
+                local m = velFromDelta.Magnitude
+                if m > bestMag then bestVel, bestMag = velFromDelta, m end
+            end
+            local pm = physVel.Magnitude
+            if pm > bestMag then bestVel, bestMag = physVel, pm end
+
+            if bestVel and bestMag >= d.velocityMin then
+                local toMe = myPos - part.Position
+                local distToMe = toMe.Magnitude
+                if distToMe > 0.5 then
+                    local approach = bestVel.Unit:Dot(toMe.Unit)
+                    -- приближается?
+                    local approaching = true
+                    if tr then
+                        local prevDist = (tr.pos - myPos).Magnitude
+                        approaching = distToMe < prevDist + 0.05
+                    end
+                    if approach > d.approachDot and approaching then
+                        state.intel.liveSignals += 1
+                        local perp = pickDodgeDir(myPos, part.Position, bestVel)
+                        doDodge(perp, false, part.Position)
+                        dodgeStats.Text = getStatsText()
+                        break
+                    end
+                end
+            end
+        end
+    end
+
+    -- cleanup tracking table
+    if now - trackLastCleanup > 1 then
+        trackLastCleanup = now
+        for p, tr in pairs(tracked) do
+            if now - tr.lastSeen > TRACK_TTL or not p.Parent then
+                tracked[p] = nil
+            end
+        end
+        for p in pairs(lastDodgePerPart) do
+            if not p.Parent then lastDodgePerPart[p] = nil end
         end
     end
 end)
 
 --==================================================
+-- LAYER 5: REMOTE HOOK + SCRIPT SCAN (INTEL)
+--==================================================
+
+local hookedRemotes = {}
+
+local function hookRemote(inst)
+    if hookedRemotes[inst] then return end
+    if not (inst:IsA("RemoteEvent") or inst:IsA("UnreliableRemoteEvent")) then return end
+    hookedRemotes[inst] = true
+    inst.OnClientEvent:Connect(function()
+        if nameIsAttack(inst.Name) then
+            state.intel.liveSignals += 1
+            if state.dodge.enabled and hrp then
+                local a = math.random() * math.pi * 2
+                doDodge(Vector3.new(math.cos(a), 0, math.sin(a)), true, nil)
+            end
+            dodgeStats.Text = getStatsText()
+        end
+    end)
+end
+
+for _, obj in ipairs(RS:GetDescendants()) do hookRemote(obj) end
+RS.DescendantAdded:Connect(hookRemote)
+
+local function addIntelRow(text, color)
+    local row = Instance.new("TextLabel")
+    row.Size = UDim2.new(1, -4, 0, 14)
+    row.BackgroundTransparency = 1
+    row.Text = text
+    row.TextColor3 = color or Color3.fromRGB(180, 200, 230)
+    row.TextSize = 9
+    row.TextXAlignment = Enum.TextXAlignment.Left
+    row.TextTruncate = Enum.TextTruncate.AtEnd
+    row.Font = Enum.Font.Code
+    row.LayoutOrder = #intelScroll:GetChildren()
+    row.Parent = intelScroll
+    return row
+end
+
+local function clearIntel()
+    for _, c in ipairs(intelScroll:GetChildren()) do
+        if c:IsA("TextLabel") then c:Destroy() end
+    end
+end
+
+local function scanScriptsAndRemotes()
+    clearIntel()
+    local nRemotes, nScripts = 0, 0
+
+    -- remotes
+    for _, obj in ipairs(RS:GetDescendants()) do
+        if (obj:IsA("RemoteEvent") or obj:IsA("UnreliableRemoteEvent"))
+           and nameIsAttack(obj.Name) then
+            nRemotes += 1
+            if nRemotes <= 30 then
+                addIntelRow("⚡ " .. obj:GetFullName(), Color3.fromRGB(255, 220, 100))
+            end
+        end
+    end
+
+    -- readable scripts (только те, что клиент владеет)
+    local scriptsRoots = { player }
+    local ps = player:FindFirstChild("PlayerScripts")
+    if ps then scriptsRoots[#scriptsRoots + 1] = ps end
+
+    for _, root in ipairs(scriptsRoots) do
+        for _, d in ipairs(root:GetDescendants()) do
+            if d:IsA("LocalScript") or d:IsA("ModuleScript") then
+                local ok, src = pcall(function() return d.Source end)
+                if ok and src and #src > 0 then
+                    local hit = nil
+                    local low = string.lower(src)
+                    for i = 1, #ATK_KEYS do
+                        if string.find(low, ATK_KEYS[i], 1, true) then
+                            hit = ATK_KEYS[i]; break
+                        end
+                    end
+                    if hit then
+                        nScripts += 1
+                        if nScripts <= 20 then
+                            addIntelRow("📜 " .. d:GetFullName() .. " · [" .. hit .. "]",
+                                Color3.fromRGB(150, 255, 180))
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if nRemotes == 0 and nScripts == 0 then
+        addIntelRow("· ничего подозрительного не найдено", Color3.fromRGB(150, 150, 170))
+        addIntelRow("· (серверные скрипты недоступны клиенту)", Color3.fromRGB(120, 120, 140))
+    end
+
+    intelStatus.Text = string.format("remotes: %d · scripts: %d", nRemotes, nScripts)
+end
+
+scanScriptsBtn.Activated:Connect(scanScriptsAndRemotes)
+
+--==================================================
 -- FOLLOW PANEL
 --==================================================
 
-local panelFollow = makePanel("follow", 260)
+local panelFollow = makePanel("follow", 200)
 
-mkToggle(panelFollow, "ПОСТОЯННОЕ ТП К ОБЪЕКТУ", UDim2.fromOffset(0, 0),
-    UDim2.new(1, 0, 0, 26),
+mkToggle(panelFollow, "ПОСТОЯННОЕ ТП", UDim2.fromOffset(0, 0),
+    UDim2.new(1, 0, 0, 20),
     function() return state.follow.enabled end,
     function(v)
         state.follow.enabled = v
-        if v then
-            state.follow._target = findPartByName(state.follow.targetName)
-        else
-            state.follow._target = nil
-        end
+        state.follow._target = v and findPartByName(state.follow.targetName) or nil
+        state.follow._lastPos = nil
     end)
 
-mkLabel(panelFollow, "Имя объекта (Part):",
-    UDim2.fromOffset(0, 34), UDim2.new(1, 0, 0, 14))
+mkLabel(panelFollow, "Имя части:",
+    UDim2.fromOffset(0, 26), UDim2.new(1, 0, 0, 12)).TextSize = 10
 
 local followBox = Instance.new("TextBox")
-followBox.Position = UDim2.fromOffset(0, 50)
-followBox.Size = UDim2.new(1, 0, 0, 24)
-followBox.BackgroundColor3 = Color3.fromRGB(38,38,48)
-followBox.BorderSizePixel = 0; followBox.Text = ""
-followBox.PlaceholderText = "например: BossLoot"
-followBox.PlaceholderColor3 = Color3.fromRGB(170,170,180)
-followBox.TextColor3 = Color3.new(1,1,1); followBox.TextScaled = true
+followBox.Position = UDim2.fromOffset(0, 40); followBox.Size = UDim2.new(1, 0, 0, 20)
+followBox.BackgroundColor3 = Color3.fromRGB(38, 38, 48); followBox.BorderSizePixel = 0
+followBox.Text = ""; followBox.PlaceholderText = "например: BossLoot"
+followBox.PlaceholderColor3 = Color3.fromRGB(170, 170, 180)
+followBox.TextColor3 = Color3.new(1, 1, 1); followBox.TextScaled = true
 followBox.ClearTextOnFocus = false; followBox.Parent = panelFollow
-corner(followBox, 5)
+corner(followBox, 4)
 
-mkLabel(panelFollow, "Смещение Y (studs):",
-    UDim2.fromOffset(0, 82), UDim2.new(1, 0, 0, 14))
-local offLabel = mkLabel(panelFollow, tostring(state.follow.offset.Y),
-    UDim2.fromOffset(0, 98), UDim2.new(1, -60, 0, 20))
-offLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
-mkBtn(panelFollow, "−", UDim2.new(1, -56, 0, 98),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.follow.offset = state.follow.offset - Vector3.new(0, 2, 0)
-        offLabel.Text = tostring(state.follow.offset.Y)
-    end)
-mkBtn(panelFollow, "+", UDim2.new(1, -28, 0, 98),
-    UDim2.fromOffset(26, 20)).Activated:Connect(function()
-        state.follow.offset = state.follow.offset + Vector3.new(0, 2, 0)
-        offLabel.Text = tostring(state.follow.offset.Y)
-    end)
+stepper(panelFollow, 66, "Смещение Y:",
+    function() return math.floor(state.follow.offset.Y) end,
+    function(v) state.follow.offset = Vector3.new(0, v, 0) end, -20, 30, 1)
 
 local followStatus = mkLabel(panelFollow, "ждёт имя...",
-    UDim2.fromOffset(0, 128), UDim2.new(1, 0, 0, 16))
-followStatus.TextColor3 = Color3.fromRGB(150, 200, 255)
+    UDim2.fromOffset(0, 102), UDim2.new(1, 0, 0, 14))
+followStatus.TextColor3 = Color3.fromRGB(150, 200, 255); followStatus.TextSize = 10
 
-mkLabel(panelFollow, "Логика: Heartbeat проверяет наличие part с указанным именем в workspace. Если есть — телепорт каждый кадр (или при смене позиции). Если исчез — ждёт ChildAdded с этим именем и снова телепортируется, как только появится.",
-    UDim2.fromOffset(0, 150), UDim2.new(1, 0, 0, 90)).TextSize = 10
+mkLabel(panelFollow,
+    "Каждый кадр: есть target → ТП при смещении > 0.1 stud. Исчез → ждёт DescendantAdded, возобновляет ТП.",
+    UDim2.fromOffset(0, 120), UDim2.new(1, 0, 0, 70)).TextSize = 9
 
 followBox:GetPropertyChangedSignal("Text"):Connect(function()
     state.follow.targetName = followBox.Text
     if state.follow.enabled then
         state.follow._target = findPartByName(state.follow.targetName)
+        state.follow._lastPos = nil
     end
 end)
 
@@ -497,31 +747,31 @@ RunService.Heartbeat:Connect(function()
         if f._target then
             followStatus.Text = "найден: " .. f.targetName
             followStatus.TextColor3 = Color3.fromRGB(150, 255, 180)
+            f._lastPos = nil
         else
-            followStatus.Text = "ждёт появления: " .. f.targetName
+            followStatus.Text = "ждёт: " .. f.targetName
             followStatus.TextColor3 = Color3.fromRGB(255, 200, 80)
             return
         end
     end
-    local ch = player.Character
-    local hrp = ch and ch:FindFirstChild("HumanoidRootPart")
-    if not hrp then return end
-    pcall(function()
-        ch:PivotTo(CFrame.new(f._target.Position + f.offset))
-    end)
+    if not char then return end
+    local targetPos = f._target.Position + f.offset
+    if f._lastPos and (targetPos - f._lastPos).Magnitude < 0.1 then return end
+    f._lastPos = targetPos
+    pcall(function() char:PivotTo(CFrame.new(targetPos)) end)
 end)
 
--- слушаем ChildAdded в workspace — быстрый re-detect
 workspace.DescendantAdded:Connect(function(o)
     if state.follow.enabled and o:IsA("BasePart") and o.Name == state.follow.targetName then
         state.follow._target = o
+        state.follow._lastPos = nil
         followStatus.Text = "появился: " .. o.Name
         followStatus.TextColor3 = Color3.fromRGB(150, 255, 180)
     end
 end)
 
 --==================================================
--- DRAG / RESIZE
+-- DRAG / RESIZE / HIDE
 --==================================================
 
 local dragging, dragStart, startPos = false, nil, nil
@@ -536,9 +786,9 @@ dragBar.InputBegan:Connect(function(input)
     end
 end)
 
-local rh = mkBtn(frame, "◢", UDim2.new(1, -18, 1, -18),
-    UDim2.fromOffset(16, 16), Color3.fromRGB(255, 40, 65))
-rh.ZIndex = 20
+local rh = mkBtn(frame, "◢", UDim2.new(1, -14, 1, -14),
+    UDim2.fromOffset(12, 12), Color3.fromRGB(255, 40, 65))
+rh.ZIndex = 20; rh.TextSize = 8
 rh.InputBegan:Connect(function(input)
     if input.UserInputType == Enum.UserInputType.MouseButton1
        or input.UserInputType == Enum.UserInputType.Touch then
@@ -560,8 +810,8 @@ UIS.InputChanged:Connect(function(input)
     elseif resizing then
         local d = cur - rStart
         frame.Size = UDim2.fromOffset(
-            math.max(300, rStartSize.X + d.X),
-            math.max(300, rStartSize.Y + d.Y))
+            math.max(240, rStartSize.X + d.X),
+            math.max(240, rStartSize.Y + d.Y))
     end
 end)
 
@@ -572,54 +822,27 @@ UIS.InputEnded:Connect(function(input)
     end
 end)
 
---==================================================
--- HIDE / SHOW
---==================================================
-
 local reopenBtn = mkBtn(gui, "☰", UDim2.new(0, 20, 0.15, 0),
-    UDim2.fromOffset(42, 42), Color3.fromRGB(120, 25, 45))
+    UDim2.fromOffset(36, 36), Color3.fromRGB(120, 25, 45))
 reopenBtn.Visible = false; reopenBtn.Draggable = true
 local ro = Instance.new("UIStroke")
-ro.Color = Color3.fromRGB(255, 40, 65); ro.Thickness = 2; ro.Parent = reopenBtn
+ro.Color = Color3.fromRGB(255, 40, 65); ro.Thickness = 1.5; ro.Parent = reopenBtn
 
-local hidden = false
-closeBtn.Activated:Connect(function() hidden = true; frame.Visible = false; reopenBtn.Visible = true end)
-reopenBtn.Activated:Connect(function() hidden = false; frame.Visible = true; reopenBtn.Visible = false end)
+closeBtn.Activated:Connect(function() frame.Visible = false; reopenBtn.Visible = true end)
+reopenBtn.Activated:Connect(function() frame.Visible = true; reopenBtn.Visible = false end)
 
 --==================================================
--- RESPAWN / INIT
+-- INIT
 --==================================================
-
-local function onCharAdded(ch)
-    local hum = ch:WaitForChild("Humanoid", 5)
-    if hum then state.dodge._lastHealth = hum.Health end
-end
-player.CharacterAdded:Connect(onCharAdded)
-if player.Character then onCharAdded(player.Character) end
-
--- автоматическое обновление списка при добавлении/удалении частей
-workspace.DescendantAdded:Connect(function(o)
-    if o:IsA("BasePart") and activeTab == "parts" then
-        task.delay(0.5, function() scanWorkspace(); refreshPartList() end)
-    end
-end)
-workspace.DescendantRemoving:Connect(function(o)
-    if o:IsA("BasePart") and activeTab == "parts" then
-        task.delay(0.5, function() scanWorkspace(); refreshPartList() end)
-    end
-end)
 
 switchTab("parts")
 scanWorkspace()
 refreshPartList()
+dodgeStats.Text = getStatsText()
 
--- F для быстрого ре-скана
 UIS.InputBegan:Connect(function(input, processed)
-    if processed then return end
-    if UIS:GetFocusedTextBox() then return end
-    if input.KeyCode == Enum.KeyCode.F then
-        scanWorkspace(); refreshPartList()
-    end
+    if processed or UIS:GetFocusedTextBox() then return end
+    if input.KeyCode == Enum.KeyCode.F then scanWorkspace(); refreshPartList() end
 end)
 
-print("[FNVB] loaded OK")
+print("[FNVB] v3 loaded OK — 5-layer dodge + intel ready")
