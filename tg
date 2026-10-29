@@ -1,7 +1,7 @@
--- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio (LocalScript → StarterPlayerScripts)
--- v4: safe-position dodge (wall/floor/threat checks), batched spawn scan, remote hook, script intel.
+-- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
+-- v5: predicted impact point + time-to-impact + adaptive radius + optimized safe search.
 
-print("[FNVB] loading v4...")
+print("[FNVB] loading v5...")
 
 local Players, UIS, RunService, RS =
     game:GetService("Players"), game:GetService("UserInputService"),
@@ -35,15 +35,17 @@ end
 local state = {
     dodge = {
         enabled       = false,
-        velocityMin   = 15,
-        approachDot   = 0.30,
-        reactRadius   = 50,
-        dodgeDist     = 13,
-        cooldown      = 0.25,
-        urgentCD      = 0.10,
-        verticalBias  = 0.15,
-        spawnRadius   = 12,
-        safeMargin    = 3.5,   -- радиус проверки «нет ли чужой атаки» в точке
+        velocityMin   = 8,          -- v5: ещё ниже, ловим медленные хитбоксы
+        reactRadius   = 55,
+        dodgeDist     = 14,
+        cooldown      = 0.12,       -- v5: быстрее, чем v4
+        urgentCD      = 0.05,       -- v5: срочный почти без задержки
+        reactionTime  = 0.12,       -- v5: сколько секунд "запаса" хочет dodge
+        ttiThreshold  = 0.28,       -- v5: если TTI меньше — срочный рывок
+        adaptiveBoost = 1.0,        -- v5: множитель дистанции от скорости
+        maxCandidates = 9,          -- v5: меньше кандидатов = быстрее
+        spawnRadius   = 10,
+        safeMargin    = 2.5,        -- v5: уже, чем v4 (меньше ложных отказов)
         _lastDodge    = 0,
         _lastHealth   = nil,
         _dodges       = 0,
@@ -58,9 +60,7 @@ local state = {
     parts = {
         filter = "", showAnchoredOnly = false, maxList = 200, _list = {},
     },
-    intel = {
-        liveSignals = 0,
-    },
+    intel = { liveSignals = 0 },
 }
 
 --==================================================
@@ -126,7 +126,7 @@ gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 50; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(280, 380)
+frame.Size = UDim2.fromOffset(280, 400)
 frame.Position = UDim2.new(0, 20, 0.08, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
 frame.BorderSizePixel = 0; frame.Active = true
@@ -139,7 +139,7 @@ outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Pa
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
 
-local dragBar = mkBtn(header, "FNVB4",
+local dragBar = mkBtn(header, "FNVB5",
     UDim2.fromOffset(6, 0), UDim2.new(0, 50, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1
 dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
@@ -308,9 +308,9 @@ end)
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 600)
+local panelDodge = makePanel("dodge", 640)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v4 (safe)", UDim2.fromOffset(0, 0),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v5 (predictive)", UDim2.fromOffset(0, 0),
     UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
@@ -332,46 +332,43 @@ local function stepper(parent, y, labelText, getter, setter, min, max, step, fmt
     return val
 end
 
-stepper(panelDodge, 26, "Радиус детекта (studs):",
-    function() return state.dodge.reactRadius end,
-    function(v) state.dodge.reactRadius = v end, 10, 200, 5)
+stepper(panelDodge, 26, "Реакция (сек):",
+    function() return state.dodge.reactionTime end,
+    function(v) state.dodge.reactionTime = v end, 0, 0.5, 0.02,
+    function(v) return string.format("%.2f", v) end)
 
-stepper(panelDodge, 62, "Радиус spawn-радара:",
-    function() return state.dodge.spawnRadius end,
-    function(v) state.dodge.spawnRadius = v end, 3, 40, 1)
+stepper(panelDodge, 62, "TTI порог (сек):",
+    function() return state.dodge.ttiThreshold end,
+    function(v) state.dodge.ttiThreshold = v end, 0.05, 1.0, 0.05,
+    function(v) return string.format("%.2f", v) end)
 
 stepper(panelDodge, 98, "Дистанция рывка:",
     function() return state.dodge.dodgeDist end,
-    function(v) state.dodge.dodgeDist = v end, 3, 60, 2)
+    function(v) state.dodge.dodgeDist = v end, 4, 60, 2)
 
-stepper(panelDodge, 134, "Мин. скорость (studs/s):",
-    function() return state.dodge.velocityMin end,
-    function(v) state.dodge.velocityMin = v end, 1, 300, 5)
+stepper(panelDodge, 134, "Радиус детекта:",
+    function() return state.dodge.reactRadius end,
+    function(v) state.dodge.reactRadius = v end, 15, 200, 5)
 
-stepper(panelDodge, 170, "Порог подлёта:",
-    function() return math.floor(state.dodge.approachDot * 100) end,
-    function(v) state.dodge.approachDot = v / 100 end, 0, 100, 5,
-    function(v) return tostring(v) .. "%" end)
-
-stepper(panelDodge, 206, "Safe-радиус (чужие атаки):",
-    function() return state.dodge.safeMargin * 10 end,
-    function(v) state.dodge.safeMargin = v / 10 end, 10, 100, 5,
-    function(v) return string.format("%.1f", v / 10) end)
+stepper(panelDodge, 170, "Адаптивный буст:",
+    function() return state.dodge.adaptiveBoost end,
+    function(v) state.dodge.adaptiveBoost = v end, 0, 3, 0.1,
+    function(v) return string.format("%.1f", v) end)
 
 local dodgeStats = mkLabel(panelDodge, "рывков: 0 · срочных: 0 · отказов: 0 · сигналов: 0",
-    UDim2.fromOffset(0, 244), UDim2.new(1, 0, 0, 14))
+    UDim2.fromOffset(0, 208), UDim2.new(1, 0, 0, 14))
 dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
 mkLabel(panelDodge, "— INTEL —",
-    UDim2.fromOffset(0, 264), UDim2.new(1, 0, 0, 12),
+    UDim2.fromOffset(0, 228), UDim2.new(1, 0, 0, 12),
     Enum.TextXAlignment.Center).TextColor3 = Color3.fromRGB(255, 100, 130)
 
 local intelStatus = mkLabel(panelDodge, "не сканировано",
-    UDim2.fromOffset(0, 278), UDim2.new(1, 0, 0, 14))
+    UDim2.fromOffset(0, 242), UDim2.new(1, 0, 0, 14))
 intelStatus.TextColor3 = Color3.fromRGB(150, 200, 255); intelStatus.TextSize = 10
 
 local intelList = Instance.new("Frame")
-intelList.Position = UDim2.fromOffset(0, 296); intelList.Size = UDim2.new(1, 0, 0, 200)
+intelList.Position = UDim2.fromOffset(0, 260); intelList.Size = UDim2.new(1, 0, 0, 200)
 intelList.BackgroundColor3 = Color3.fromRGB(28, 28, 37); intelList.BorderSizePixel = 0
 intelList.Parent = panelDodge; corner(intelList, 4)
 
@@ -387,30 +384,30 @@ intelLL.Padding = UDim.new(0, 1); intelLL.SortOrder = Enum.SortOrder.LayoutOrder
 intelLL.Parent = intelScroll
 
 local scanScriptsBtn = mkBtn(panelDodge, "СКАНИРОВАТЬ СКРИПТЫ + РЕМОУТЫ",
-    UDim2.fromOffset(0, 502), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
+    UDim2.fromOffset(0, 466), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
 
 mkLabel(panelDodge,
-    "Клиент читает только LocalScript/ModuleScript, что к нему долетели. Server Script .Source недоступен — защита движка. Remote-имена + spawn-детект ловят атаки лучше, чем чтение серверных скриптов.",
-    UDim2.fromOffset(0, 526), UDim2.new(1, 0, 0, 68)).TextSize = 9
+    "v5: предсказывает точку столкновения и время до неё (TTI). Если TTI < порога — срочный рывок. Дистанция растёт со скоростью снаряда. Кандидаты сокращены до 9.",
+    UDim2.fromOffset(0, 490), UDim2.new(1, 0, 0, 70)).TextSize = 9
 
 --==================================================
--- SAFE DODGE ENGINE (v4)
+-- v5 DODGE ENGINE
 --==================================================
 
 local overlapParams = OverlapParams.new()
 overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-overlapParams.MaxParts = 50
+overlapParams.MaxParts = 30
 
 local envParams = RaycastParams.new()
 envParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local threatParams = OverlapParams.new()
 threatParams.FilterType = Enum.RaycastFilterType.Exclude
-threatParams.MaxParts = 12
+threatParams.MaxParts = 8
 
 local tracked = {}
 local trackLastCleanup = 0
-local TRACK_TTL = 0.6
+local TRACK_TTL = 0.5
 
 local pendingSpawn = {}
 local spawnCheckQueued = false
@@ -422,7 +419,7 @@ local function getStatsText()
         d._dodges, d._dodgesUrgent, d._refused, state.intel.liveSignals)
 end
 
--- классификация: опасна ли часть
+-- опасна ли часть
 local function isDangerPart(part)
     if not part or not part.Parent then return false end
     if char and part:IsDescendantOf(char) then return false end
@@ -440,55 +437,67 @@ local function isDangerPart(part)
     return false
 end
 
--- проверка: стена + пол + чужие атаки
+-- БЫСТРАЯ проверка пола: Humanoid.FloorMaterial если стоим, иначе raycast вниз 12 studs
+local function hasFloor(pos)
+    if hum and hum.FloorMaterial ~= Enum.Material.Air then
+        -- стоим на чём-то; целевая точка чуть в стороне, всё равно проверим
+    end
+    local hit = workspace:Raycast(pos + Vector3.new(0, 0.5, 0),
+        Vector3.new(0, -12, 0), envParams)
+    return hit ~= nil
+end
+
+-- проверка: целевая точка не занята стеной/атакой
 local function isPositionSafe(pos)
     if not char or not hrp then return false end
-    -- 1) стена между игроком и точкой
+    -- 1) стена между игроком и точкой (один ray)
     envParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
     local toTarget = pos - hrp.Position
     if toTarget.Magnitude > 0.1 then
-        local wallHit = workspace:Raycast(hrp.Position, toTarget, envParams)
-        if wallHit then return false end
+        if workspace:Raycast(hrp.Position, toTarget, envParams) then return false end
     end
-    -- 2) пол под целевой точкой
-    local floorHit = workspace:Raycast(pos + Vector3.new(0, 1, 0),
-        Vector3.new(0, -6, 0), envParams)
-    if not floorHit then return false end
-    -- 3) чужие атаки в целевой точке
+    -- 2) целевая точка не внутри геометрии (маленький overlap, исключая только персонажа)
     threatParams.FilterDescendantsInstances = { char }
-    local parts = workspace:GetPartBoundsInRadius(pos, state.dodge.safeMargin, threatParams)
-    for _, p in ipairs(parts) do
+    local inPos = workspace:GetPartBoundsInRadius(pos, 1.2, threatParams)
+    for _, p in ipairs(inPos) do
+        if not p:IsDescendantOf(char) and p.CanCollide then return false end
+    end
+    -- 3) чужие атаки в точке
+    local threats = workspace:GetPartBoundsInRadius(pos, state.dodge.safeMargin, threatParams)
+    for _, p in ipairs(threats) do
         if isDangerPart(p) then return false end
     end
+    -- 4) пол (мягкая проверка: только если высоко)
+    if not hasFloor(pos) then return false end
     return true
 end
 
--- кандидаты: от источника + перпендикуляры к скорости + веер ±45°
+-- сокращённые кандидаты: 3 базовых × 3 угла = 9
 local function buildCandidates(myPos, sourcePos, velDir)
-    local baseDirs = {}
+    local bases = {}
     if sourcePos then
         local away = Vector3.new(myPos.X - sourcePos.X, 0, myPos.Z - sourcePos.Z)
-        if away.Magnitude > 0.1 then baseDirs[#baseDirs + 1] = away.Unit end
+        if away.Magnitude > 0.1 then bases[#bases + 1] = away.Unit end
     end
     if velDir and velDir.Magnitude > 0.1 then
         local v = Vector3.new(velDir.X, 0, velDir.Z)
         if v.Magnitude > 0.1 then
             v = v.Unit
             local perp = Vector3.new(-v.Z, 0, v.X)
-            baseDirs[#baseDirs + 1] = perp
-            baseDirs[#baseDirs + 1] = -perp
+            bases[#bases + 1] = perp
+            bases[#bases + 1] = -perp
         end
     end
-    if #baseDirs == 0 then
+    if #bases == 0 then
         local a = math.random() * math.pi * 2
-        baseDirs[1] = Vector3.new(math.cos(a), 0, math.sin(a))
+        bases[1] = Vector3.new(math.cos(a), 0, math.sin(a))
     end
 
     local seen, out = {}, {}
-    for _, b in ipairs(baseDirs) do
-        for angle = -45, 45, 15 do
+    for _, b in ipairs(bases) do
+        for angle = -30, 30, 30 do
             local rot = CFrame.Angles(0, math.rad(angle), 0)
-            local d = (rot * b)
+            local d = rot * b
             d = Vector3.new(d.X, 0, d.Z)
             if d.Magnitude > 0.01 then
                 d = d.Unit
@@ -503,11 +512,53 @@ local function buildCandidates(myPos, sourcePos, velDir)
     return out
 end
 
-local function findSafeDodgePosition(myPos, sourcePos, velDir)
-    local dirs = buildCandidates(myPos, sourcePos, velDir)
+-- v5: предсказание + TTI + адаптивная дистанция
+local function analyzeThreat(part, myPos)
+    local vel = part.AssemblyLinearVelocity
+    local mag = vel.Magnitude
+    if mag < 1 then return nil end
+    local toMe = myPos - part.Position
+    local dist = toMe.Magnitude
+    if dist < 0.5 then return nil end
+    local approach = vel.Unit:Dot(toMe.Unit)
+    if approach < 0.15 then return nil end -- не к нам
+
+    -- TTI: время до ближайшего сближения (линейное приближение)
+    local closing = vel:Dot(toMe.Unit) -- studs/s toward player
+    if closing <= 0.1 then return nil end
+    local tti = dist / closing
+
+    -- предсказанная точка удара
+    local impact = part.Position + vel * tti
+
+    -- адаптивная дистанция: быстрее/больше снаряд -> дальше рывок
+    local sizeBoost = math.clamp(part.Size.Magnitude / 6, 0.5, 2.0)
+    local speedBoost = 1 + math.clamp(mag / 100, 0, 1) * state.dodge.adaptiveBoost
+    local distOut = state.dodge.dodgeDist * sizeBoost * speedBoost
+
+    return {
+        tti = tti,
+        impact = impact,
+        vel = vel,
+        dist = dist,
+        approach = approach,
+        mag = mag,
+        dodgeDist = math.min(distOut, 45),
+    }
+end
+
+local function findSafeDodgePosition(myPos, threat, urgent)
+    local dd = threat and threat.dodgeDist or state.dodge.dodgeDist
+    local dirs = buildCandidates(myPos,
+        threat and threat.impact or nil,
+        threat and threat.vel or nil)
     for _, d in ipairs(dirs) do
-        local pos = myPos + d * state.dodge.dodgeDist
+        local pos = myPos + d * dd
         if isPositionSafe(pos) then return pos end
+    end
+    -- fallback: чисто вверх, если срочно
+    if urgent and hasFloor(myPos + Vector3.new(0, 3, 0)) then
+        return myPos + Vector3.new(0, 5, 0)
     end
     return nil
 end
@@ -526,7 +577,7 @@ local function doDodgeAt(safePos, urgent)
 end
 
 --==================================================
--- SPAWN DETECTOR (Layer 3) — batched
+-- SPAWN DETECTOR
 --==================================================
 
 workspace.DescendantAdded:Connect(function(o)
@@ -546,25 +597,21 @@ workspace.DescendantAdded:Connect(function(o)
             if part.Parent then
                 local dist = (part.Position - myPos).Magnitude
                 if dist <= d.spawnRadius then
-                    local hot = false
-                    if dist < 3 then hot = true end
-                    if not hot and nameIsAttack(part.Name) then hot = true end
-                    if not hot and part:FindFirstChildWhichIsA("ParticleEmitter") then hot = true end
-                    if not hot and (part:FindFirstChildWhichIsA("Beam")
-                        or part:FindFirstChildWhichIsA("Trail")) then hot = true end
-                    if not hot and part:FindFirstChildWhichIsA("Fire") then hot = true end
-                    if not hot and part.Size.Magnitude < 6 and not part.Anchored then
-                        hot = true
-                    end
+                    local hot = (dist < 3)
+                        or nameIsAttack(part.Name)
+                        or part:FindFirstChildWhichIsA("ParticleEmitter")
+                        or part:FindFirstChildWhichIsA("Beam")
+                        or part:FindFirstChildWhichIsA("Trail")
+                        or part:FindFirstChildWhichIsA("Fire")
+                        or (part.Size.Magnitude < 6 and not part.Anchored)
                     if hot then
                         local now = os.clock()
-                        local lastT = lastDodgePerPart[part] or 0
-                        if now - lastT > 0.2 then
+                        if now - (lastDodgePerPart[part] or 0) > 0.15 then
                             lastDodgePerPart[part] = now
                             state.intel.liveSignals += 1
-                            local safePos = findSafeDodgePosition(myPos,
-                                part.Position, part.AssemblyLinearVelocity)
-                            doDodgeAt(safePos, true)
+                            local threat = analyzeThreat(part, myPos)
+                            local safe = findSafeDodgePosition(myPos, threat, true)
+                            doDodgeAt(safe, true)
                         end
                     end
                     tracked[part] = { pos = part.Position, t = os.clock(), lastSeen = os.clock() }
@@ -575,7 +622,7 @@ workspace.DescendantAdded:Connect(function(o)
 end)
 
 --==================================================
--- MAIN HEARTBEAT (Layers 1,2,4)
+-- MAIN HEARTBEAT
 --==================================================
 
 RunService.Heartbeat:Connect(function()
@@ -584,15 +631,15 @@ RunService.Heartbeat:Connect(function()
     local now = os.clock()
     local myPos = hrp.Position
 
-    -- LAYER 4: health fallback
+    -- health fallback
     if d._lastHealth and hum.Health < d._lastHealth - 0.01 then
         state.intel.liveSignals += 1
-        local safePos = findSafeDodgePosition(myPos, nil, nil)
-        doDodgeAt(safePos, true)
+        local safe = findSafeDodgePosition(myPos, nil, true)
+        doDodgeAt(safe, true)
     end
     d._lastHealth = hum.Health
 
-    -- LAYERS 1+2: velocity + delta
+    -- scan radius
     overlapParams.FilterDescendantsInstances = { char }
     local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
 
@@ -608,30 +655,31 @@ RunService.Heartbeat:Connect(function()
             end
             tracked[part] = { pos = part.Position, t = now, lastSeen = now }
 
-            local physVel = part.AssemblyLinearVelocity
-            local bestVel, bestMag = nil, 0
-            if velFromDelta then
-                local m = velFromDelta.Magnitude
-                if m > bestMag then bestVel, bestMag = velFromDelta, m end
+            -- выбираем скорость: физика или дельта
+            local vel = part.AssemblyLinearVelocity
+            if velFromDelta and velFromDelta.Magnitude > vel.Magnitude then
+                vel = velFromDelta
             end
-            local pm = physVel.Magnitude
-            if pm > bestMag then bestVel, bestMag = physVel, pm end
 
-            if bestVel and bestMag >= d.velocityMin then
-                local toMe = myPos - part.Position
-                local distToMe = toMe.Magnitude
-                if distToMe > 0.5 then
-                    local approach = bestVel.Unit:Dot(toMe.Unit)
+            if vel.Magnitude >= d.velocityMin then
+                -- используем analyzeThreat для предсказания
+                local threat = analyzeThreat(part, myPos)
+                if threat and threat.approach > 0.15 then
+                    -- проверяем, что реально приближается (по дельте)
                     local approaching = true
                     if tr then
                         local prevDist = (tr.pos - myPos).Magnitude
-                        approaching = distToMe < prevDist + 0.05
+                        approaching = threat.dist < prevDist + 0.2
                     end
-                    if approach > d.approachDot and approaching then
-                        state.intel.liveSignals += 1
-                        local safePos = findSafeDodgePosition(myPos, part.Position, bestVel)
-                        doDodgeAt(safePos, false)
-                        break
+                    if approaching then
+                        local urgent = threat.tti <= d.ttiThreshold
+                            or threat.approach > 0.7
+                        if urgent or threat.tti <= d.reactionTime + 0.08 then
+                            state.intel.liveSignals += 1
+                            local safe = findSafeDodgePosition(myPos, threat, urgent)
+                            doDodgeAt(safe, urgent)
+                            break
+                        end
                     end
                 end
             end
@@ -653,7 +701,7 @@ RunService.Heartbeat:Connect(function()
 end)
 
 --==================================================
--- REMOTE HOOK + SCRIPT INTEL (Layer 5)
+-- REMOTE HOOK + INTEL
 --==================================================
 
 local hookedRemotes = {}
@@ -666,8 +714,8 @@ local function hookRemote(inst)
             state.intel.liveSignals += 1
             if state.dodge.enabled and hrp then
                 local myPos = hrp.Position
-                local safePos = findSafeDodgePosition(myPos, nil, nil)
-                doDodgeAt(safePos, true)
+                local safe = findSafeDodgePosition(myPos, nil, true)
+                doDodgeAt(safe, true)
             end
         end
     end)
@@ -682,8 +730,7 @@ local function addIntelRow(text, color)
     row.BackgroundTransparency = 1
     row.Text = text
     row.TextColor3 = color or Color3.fromRGB(180, 200, 230)
-    row.TextSize = 9
-    row.TextXAlignment = Enum.TextXAlignment.Left
+    row.TextSize = 9; row.TextXAlignment = Enum.TextXAlignment.Left
     row.TextTruncate = Enum.TextTruncate.AtEnd
     row.Font = Enum.Font.Code
     row.LayoutOrder = #intelScroll:GetChildren()
@@ -910,4 +957,4 @@ UIS.InputBegan:Connect(function(input, processed)
     if input.KeyCode == Enum.KeyCode.F then scanWorkspace(); refreshPartList() end
 end)
 
-print("[FNVB] v4 loaded OK — safe-dodge + intel + follow ready")
+print("[FNVB] v5 loaded OK — predictive dodge + intel + follow ready")
