@@ -1,12 +1,12 @@
--- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
--- v14: ONE findBestDodgePosition per frame, batched wallcast, backoff on noSpace, cheaper candidates.
+-- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio (LocalScript → StarterPlayerScripts)
+-- v15: fixed dodge tick (40 Hz), cheap scoring, camera cache, LOW GFX toggle with restore.
 
-print("[FNVB] loading v14...")
+print("[FNVB] loading v15...")
 
-local Players, UIS, RunService, RS, CS =
+local Players, UIS, RunService, RS, CS, Lighting =
     game:GetService("Players"), game:GetService("UserInputService"),
     game:GetService("RunService"), game:GetService("ReplicatedStorage"),
-    game:GetService("CollectionService")
+    game:GetService("CollectionService"), game:GetService("Lighting")
 
 local player = Players.LocalPlayer
 if not player then return end
@@ -47,22 +47,26 @@ end
 local state = {
     dodge = {
         enabled = false, hoverEnabled = false,
-        reactRadius = 50, autoMinDist = 10, autoMaxDist = 34,
+        reactRadius = 45,                  -- v15: было 50
+        autoMinDist = 10, autoMaxDist = 34,
         verticalBias = 0.3, maxVerticalTTI = 0.40,
-        _lastHealth = nil, _dodges = 0, _refused = 0, _emergency = 0,
-        _reEngage = 0, _noSpace = 0, _staticDodges = 0, _touchDodges = 0,
-        _verticalDodges = 0,
+        _lastHealth = nil,
+        _dodges = 0, _refused = 0, _emergency = 0,
+        _reEngage = 0, _noSpace = 0,
+        _staticDodges = 0, _touchDodges = 0, _verticalDodges = 0,
         _lastGlobalDodge = 0, _globalCD = 0.08,
         _attempted = false, _underThreat = false,
         _lastPickedDist = 14, _lastPickedVertical = false,
-        _consecutiveNoSpace = 0,
-        _noSpaceUntil = 0,
-        _peakTried = 0,
+        _consecutiveNoSpace = 0, _noSpaceUntil = 0, _peakTried = 0,
+        _dodgeTick = 0, _dodgeInterval = 1 / 40,   -- v15: 40 Гц
     },
     follow = { enabled = false, targetName = "", offset = Vector3.new(0, 5, 0),
                _target = nil, _lastPos = nil, _pauseUntil = 0 },
     parts  = { filter = "", showAnchoredOnly = false, maxList = 200, _list = {} },
     intel  = { liveSignals = 0 },
+    gfx = { low = false, savedLighting = nil, savedEffects = {},
+            savedParticles = {}, savedTextures = {}, savedShadows = {},
+            savedWater = nil },
 }
 
 --==================================================
@@ -231,6 +235,109 @@ end)
 if player.Character then updateChar(player.Character) end
 
 --==================================================
+-- LOW GFX
+--==================================================
+
+local lowGfxBtn
+local function restoreGfx()
+    if not state.gfx.low then return end
+    state.gfx.low = false
+    if state.gfx.savedLighting then
+        for k, v in pairs(state.gfx.savedLighting) do
+            pcall(function() Lighting[k] = v end)
+        end
+        state.gfx.savedLighting = nil
+    end
+    for obj, val in pairs(state.gfx.savedEffects) do
+        if obj and obj.Parent then pcall(function() obj.Enabled = val end) end
+    end
+    state.gfx.savedEffects = {}
+    for obj, val in pairs(state.gfx.savedParticles) do
+        if obj and obj.Parent then pcall(function() obj.Enabled = val end) end
+    end
+    state.gfx.savedParticles = {}
+    for obj, val in pairs(state.gfx.savedTextures) do
+        if obj and obj.Parent then pcall(function() obj.Transparency = val end) end
+    end
+    state.gfx.savedTextures = {}
+    for obj in pairs(state.gfx.savedShadows) do
+        if obj and obj.Parent then pcall(function() obj.CastShadow = true end) end
+    end
+    state.gfx.savedShadows = {}
+    if state.gfx.savedWater then
+        local w = state.gfx.savedWater
+        pcall(function()
+            workspace.Terrain.WaterWaveSize = w.waveSize
+            workspace.Terrain.WaterWaveSpeed = w.waveSpeed
+        end)
+        state.gfx.savedWater = nil
+    end
+    if lowGfxBtn then
+        lowGfxBtn.Text = "○ LOW GFX"
+        lowGfxBtn.BackgroundColor3 = Color3.fromRGB(48, 48, 60)
+    end
+end
+
+local function applyGfx()
+    if state.gfx.low then restoreGfx(); return end
+    state.gfx.low = true
+    -- Lighting
+    state.gfx.savedLighting = {
+        GlobalShadows = Lighting.GlobalShadows,
+        FogEnd = Lighting.FogEnd,
+        FogStart = Lighting.FogStart,
+        EnvironmentDiffuseScale = Lighting.EnvironmentDiffuseScale,
+        EnvironmentSpecularScale = Lighting.EnvironmentSpecularScale,
+    }
+    Lighting.GlobalShadows = false
+    Lighting.EnvironmentDiffuseScale = 0
+    Lighting.EnvironmentSpecularScale = 0
+    -- Post effects
+    for _, child in ipairs(Lighting:GetChildren()) do
+        if child:IsA("PostEffect") and child.Enabled then
+            state.gfx.savedEffects[child] = true
+            child.Enabled = false
+        end
+    end
+    -- Particles / textures / shadows (батч, чтобы не фризить)
+    task.spawn(function()
+        local count = 0
+        for _, obj in ipairs(workspace:GetDescendants()) do
+            if not state.gfx.low then break end
+            if obj:IsA("ParticleEmitter") or obj:IsA("Trail")
+               or obj:IsA("Beam") or obj:IsA("Fire")
+               or obj:IsA("Smoke") or obj:IsA("Sparkles") then
+                if obj.Enabled then
+                    state.gfx.savedParticles[obj] = true
+                    obj.Enabled = false
+                end
+            elseif obj:IsA("Texture") or obj:IsA("Decal") then
+                state.gfx.savedTextures[obj] = obj.Transparency
+                obj.Transparency = 1
+            elseif obj:IsA("BasePart") and obj.CastShadow then
+                state.gfx.savedShadows[obj] = true
+                obj.CastShadow = false
+            end
+            count += 1
+            if count % 200 == 0 then task.wait() end
+        end
+        -- Terrain water
+        pcall(function()
+            state.gfx.savedWater = {
+                waveSize = workspace.Terrain.WaterWaveSize,
+                waveSpeed = workspace.Terrain.WaterWaveSpeed,
+            }
+            workspace.Terrain.WaterWaveSize = 0
+            workspace.Terrain.WaterWaveSpeed = 0
+        end)
+    end)
+    if lowGfxBtn then
+        lowGfxBtn.Text = "✓ LOW GFX"
+        lowGfxBtn.BackgroundColor3 = Color3.fromRGB(35, 115, 65)
+    end
+end
+
+--==================================================
 -- UI HELPERS
 --==================================================
 
@@ -275,7 +382,7 @@ gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 50; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(280, 420)
+frame.Size = UDim2.fromOffset(280, 440)
 frame.Position = UDim2.new(0, 20, 0.08, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
 frame.BorderSizePixel = 0; frame.Active = true
@@ -286,7 +393,7 @@ outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Pa
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
-local dragBar = mkBtn(header, "FNVB14", UDim2.fromOffset(6, 0),
+local dragBar = mkBtn(header, "FNVB15", UDim2.fromOffset(6, 0),
     UDim2.new(0, 56, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1; dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
 dragBar.TextXAlignment = Enum.TextXAlignment.Left; dragBar.TextSize = 12
@@ -432,9 +539,9 @@ end)
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 640)
+local panelDodge = makePanel("dodge", 700)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v14", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v15", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
 
@@ -443,16 +550,21 @@ hoverBtn = mkBtn(panelDodge, "○ ЗАСТЫТЬ В ВОЗДУХЕ [H]",
     Color3.fromRGB(48, 48, 60), Enum.Font.Gotham); hoverBtn.TextSize = 10
 hoverBtn.Activated:Connect(function() setHover(not state.dodge.hoverEnabled) end)
 
-mkLabel(panelDodge, "Вертикальный биас:", UDim2.fromOffset(0, 54), UDim2.new(1, 0, 0, 12)).TextSize = 10
+lowGfxBtn = mkBtn(panelDodge, "○ LOW GFX",
+    UDim2.fromOffset(0, 50), UDim2.new(1, 0, 0, 22),
+    Color3.fromRGB(48, 48, 60), Enum.Font.Gotham); lowGfxBtn.TextSize = 10
+lowGfxBtn.Activated:Connect(applyGfx)
+
+mkLabel(panelDodge, "Вертикальный биас:", UDim2.fromOffset(0, 80), UDim2.new(1, 0, 0, 12)).TextSize = 10
 local vbLabel = mkLabel(panelDodge, string.format("%.1f", state.dodge.verticalBias),
-    UDim2.fromOffset(0, 68), UDim2.new(1, -50, 0, 18))
+    UDim2.fromOffset(0, 94), UDim2.new(1, -50, 0, 18))
 vbLabel.TextColor3 = Color3.fromRGB(255, 200, 80); vbLabel.TextSize = 10
-mkBtn(panelDodge, "−", UDim2.new(1, -46, 0, 68), UDim2.fromOffset(22, 18))
+mkBtn(panelDodge, "−", UDim2.new(1, -46, 0, 94), UDim2.fromOffset(22, 18))
     .Activated:Connect(function()
         state.dodge.verticalBias = math.max(0, state.dodge.verticalBias - 0.1)
         vbLabel.Text = string.format("%.1f", state.dodge.verticalBias)
     end)
-mkBtn(panelDodge, "+", UDim2.new(1, -22, 0, 68), UDim2.fromOffset(22, 18))
+mkBtn(panelDodge, "+", UDim2.new(1, -22, 0, 94), UDim2.fromOffset(22, 18))
     .Activated:Connect(function()
         state.dodge.verticalBias = math.min(1, state.dodge.verticalBias + 0.1)
         vbLabel.Text = string.format("%.1f", state.dodge.verticalBias)
@@ -460,29 +572,29 @@ mkBtn(panelDodge, "+", UDim2.new(1, -22, 0, 68), UDim2.fromOffset(22, 18))
 
 local dodgeStats = mkLabel(panelDodge,
     "рывков: 0 · верт: 0 · статик: 0 · тач: 0",
-    UDim2.fromOffset(0, 92), UDim2.new(1, 0, 0, 14))
+    UDim2.fromOffset(0, 118), UDim2.new(1, 0, 0, 14))
 dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
 local distLabel = mkLabel(panelDodge, "последняя: 14 studs · гориз",
-    UDim2.fromOffset(0, 110), UDim2.new(1, 0, 0, 14))
+    UDim2.fromOffset(0, 136), UDim2.new(1, 0, 0, 14))
 distLabel.TextColor3 = Color3.fromRGB(255, 200, 80); distLabel.TextSize = 10
 
-local perfLabel = mkLabel(panelDodge, "nosapce: 0 · tried: 0 · peak: 0",
-    UDim2.fromOffset(0, 128), UDim2.new(1, 0, 0, 12))
+local perfLabel = mkLabel(panelDodge, "noSpace: 0 · consec: 0 · peak: 0",
+    UDim2.fromOffset(0, 154), UDim2.new(1, 0, 0, 12))
 perfLabel.TextColor3 = Color3.fromRGB(150, 200, 255); perfLabel.TextSize = 9
 
 local bodyLabel = mkLabel(panelDodge, "тело: нет",
-    UDim2.fromOffset(0, 144), UDim2.new(1, 0, 0, 12))
+    UDim2.fromOffset(0, 170), UDim2.new(1, 0, 0, 12))
 bodyLabel.TextColor3 = Color3.fromRGB(150, 200, 255); bodyLabel.TextSize = 9
 
-mkLabel(panelDodge, "— INTEL —", UDim2.fromOffset(0, 164), UDim2.new(1, 0, 0, 12),
+mkLabel(panelDodge, "— INTEL —", UDim2.fromOffset(0, 190), UDim2.new(1, 0, 0, 12),
     Enum.TextXAlignment.Center).TextColor3 = Color3.fromRGB(255, 100, 130)
 local intelStatus = mkLabel(panelDodge, "не сканировано",
-    UDim2.fromOffset(0, 178), UDim2.new(1, 0, 0, 14))
+    UDim2.fromOffset(0, 204), UDim2.new(1, 0, 0, 14))
 intelStatus.TextColor3 = Color3.fromRGB(150, 200, 255); intelStatus.TextSize = 10
 
 local intelList = Instance.new("Frame")
-intelList.Position = UDim2.fromOffset(0, 196); intelList.Size = UDim2.new(1, 0, 0, 160)
+intelList.Position = UDim2.fromOffset(0, 222); intelList.Size = UDim2.new(1, 0, 0, 140)
 intelList.BackgroundColor3 = Color3.fromRGB(28, 28, 37); intelList.BorderSizePixel = 0
 intelList.Parent = panelDodge; corner(intelList, 4)
 local intelScroll = Instance.new("ScrollingFrame")
@@ -494,19 +606,19 @@ local intelLL = Instance.new("UIListLayout")
 intelLL.Padding = UDim.new(0, 1); intelLL.SortOrder = Enum.SortOrder.LayoutOrder; intelLL.Parent = intelScroll
 
 local scanScriptsBtn = mkBtn(panelDodge, "СКАН СКРИПТЫ + РЕМОУТЫ",
-    UDim2.fromOffset(0, 364), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
+    UDim2.fromOffset(0, 370), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
 
 mkLabel(panelDodge,
-    "v14: ОДИН findBestDodgePosition на кадр. Batched wallcast (один луч на направление). Backoff при noSpace (0.4с). Скип статик/тач если _attempted. MaxParts=10.",
-    UDim2.fromOffset(0, 388), UDim2.new(1, 0, 0, 80)).TextSize = 9
+    "v15: додж 40Гц (не каждый кадр). LOW GFX: тени/частицы/текстуры/постэффекты/вода. Кэш камеры. Реакция сохранена за счёт TTI-предсказания.",
+    UDim2.fromOffset(0, 394), UDim2.new(1, 0, 0, 80)).TextSize = 9
 
 --==================================================
--- ENGINE PARAMS
+-- ENGINE PARAMS + CACHE
 --==================================================
 
 local overlapParams = OverlapParams.new()
 overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-overlapParams.MaxParts = 10            -- v14: было 15
+overlapParams.MaxParts = 8                -- v15: было 10
 
 local wallParams = RaycastParams.new()
 wallParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -519,16 +631,20 @@ ceilingParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local threatParams = OverlapParams.new()
 threatParams.FilterType = Enum.RaycastFilterType.Exclude
-threatParams.MaxParts = 4
+threatParams.MaxParts = 3
 
-local MAX_TRACKED = 80
-local MAX_THREATSTATE = 80
-local MAX_SPAWNTRACK = 30
+local cachedCamera = workspace.CurrentCamera
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    cachedCamera = workspace.CurrentCamera
+end)
 
--- v14: жёсткие лимиты по urgency
-local MAX_CAND_EMERGENCY = 5
-local MAX_CAND_FAST = 8
-local MAX_CAND_NORMAL = 12
+local MAX_TRACKED = 60
+local MAX_THREATSTATE = 60
+local MAX_SPAWNTRACK = 25
+
+local MAX_CAND_EMERGENCY = 4
+local MAX_CAND_FAST = 6
+local MAX_CAND_NORMAL = 10
 
 local threatState = {}
 local tracked = {}
@@ -540,7 +656,6 @@ local SPAWNTRACK_TTL = 1.2
 local lastTouchCheck = 0
 local lastStaticCheck = 0
 
--- v14: backoff-параметры
 local NOSPACE_BACKOFF_SHORT = 0.4
 local NOSPACE_BACKOFF_LONG = 1.2
 local NOSPACE_THRESHOLD_SHORT = 3
@@ -571,14 +686,14 @@ local function isDangerPart(part)
 end
 
 --==================================================
--- ANALYZE
+-- ANALYZE (pool)
 --==================================================
 
 local analysisPool = {}
 local analysisIdx = 0
 local function getAnalysis()
     analysisIdx = analysisIdx + 1
-    if analysisIdx > 25 then analysisIdx = 1 end
+    if analysisIdx > 20 then analysisIdx = 1 end
     if not analysisPool[analysisIdx] then analysisPool[analysisIdx] = {} end
     return analysisPool[analysisIdx]
 end
@@ -662,7 +777,7 @@ local function computeAutoDist(primaryThreat, threats)
 end
 
 --==================================================
--- PATH
+-- PATH / WALL / FLOOR / CEILING
 --==================================================
 
 local function perpDistToPath(dest, threat)
@@ -707,9 +822,8 @@ local function isRealWall(hitPart)
     return true
 end
 
--- v14: единый raycast по направлению — экономит 3-4 вызова на кандидата
 local function castWall(from, dir, dist)
-    wallParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
+    wallParams.FilterDescendantsInstances = { char, cachedCamera }
     local target = from + dir * dist
     local hit = workspace:Raycast(from, target - from, wallParams)
     while hit and not isRealWall(hit.Instance) do
@@ -729,7 +843,7 @@ end
 
 local function ceilingClear(from, pos)
     if pos.Y <= from.Y + 0.5 then return true end
-    ceilingParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
+    ceilingParams.FilterDescendantsInstances = { char, cachedCamera }
     local d = pos - from
     local hit = workspace:Raycast(from, d, ceilingParams)
     if not hit then return true end
@@ -737,7 +851,7 @@ local function ceilingClear(from, pos)
 end
 
 local function canGoVertical(myPos)
-    ceilingParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
+    ceilingParams.FilterDescendantsInstances = { char, cachedCamera }
     local hit = workspace:Raycast(myPos + Vector3.new(0, 1, 0),
         Vector3.new(0, 15, 0), ceilingParams)
     if hit and isRealWall(hit.Instance) then return false end
@@ -745,7 +859,7 @@ local function canGoVertical(myPos)
 end
 
 --==================================================
--- BASES (v14: меньше направлений, cardinal только если нужен)
+-- BASES
 --==================================================
 
 local function buildBases(myPos, threat, canUp)
@@ -783,18 +897,15 @@ local function buildBases(myPos, threat, canUp)
 end
 
 --==================================================
--- SCORE (v14: cheap-first, batch wallcast)
+-- SCORE
 --==================================================
 
 local function scoreSpot(pos, threats, primaryThreat, myPos, isVertical, fromPos)
-    -- pre-filter: pathClear (math only, ~free)
     if not pathClear(pos, primaryThreat) then return -math.huge end
     for i = 1, #threats do
         if not pathClear(pos, threats[i]) then return -math.huge end
     end
-    -- ceiling для вертикали
     if isVertical and not ceilingClear(fromPos, pos) then return -math.huge end
-    -- wallcast один раз на позицию (не на кандидата-итерацию)
     local dir = (pos - fromPos)
     local mDist = dir.Magnitude
     if mDist > 0.1 then
@@ -802,18 +913,15 @@ local function scoreSpot(pos, threats, primaryThreat, myPos, isVertical, fromPos
         local hit = castWall(fromPos, dir, mDist)
         if hit then return -math.huge end
     end
-    -- floor только для горизонтали
     if not isVertical and hum and hum.FloorMaterial ~= Enum.Material.Air then
         if not hasFloor(pos) then return -math.huge end
     end
-    -- near-threat (только для нормал, самое дорогое)
     threatParams.FilterDescendantsInstances = { char }
     local nearby = workspace:GetPartBoundsInRadius(pos, 2.5, threatParams)
     for i = 1, #nearby do
         if isDangerPart(nearby[i]) then return -math.huge end
     end
 
-    -- scoring
     local score = 0
     for i = 1, #threats do
         local perp = perpDistToPath(pos, threats[i])
@@ -833,7 +941,7 @@ local function scoreSpot(pos, threats, primaryThreat, myPos, isVertical, fromPos
 end
 
 --==================================================
--- FIND BEST DODGE POSITION (v14: early-exit + caps)
+-- FIND BEST
 --==================================================
 
 local function findBestDodgePosition(myPos, primaryThreat, threats, urgency)
@@ -846,7 +954,6 @@ local function findBestDodgePosition(myPos, primaryThreat, threats, urgency)
     elseif urgency == "fast" then maxCand = MAX_CAND_FAST
     else maxCand = MAX_CAND_NORMAL end
 
-    -- v14: только одна дистанция для emergency и fast
     local dists
     if urgency == "emergency" then dists = { baseDist }
     elseif urgency == "fast" then dists = { baseDist, baseDist * 0.85 }
@@ -869,11 +976,8 @@ local function findBestDodgePosition(myPos, primaryThreat, threats, urgency)
                 bestScore = s
                 best = pos
                 bestV = isV
-                -- v14: ранний выход при "достаточно хорошем"
                 if s >= GOOD_ENOUGH and di == 1 then
-                    if state.dodge._peakTried < tried then
-                        state.dodge._peakTried = tried
-                    end
+                    if state.dodge._peakTried < tried then state.dodge._peakTried = tried end
                     return best, (best - myPos).Magnitude, bestV
                 end
             end
@@ -904,7 +1008,7 @@ local function getStatsText()
 end
 
 --==================================================
--- TRY DODGE (v14: ЕДИНСТВЕННЫЙ вызов за кадр)
+-- TRY DODGE
 --==================================================
 
 local function tryDodge(part, threat, threats, isStatic)
@@ -913,10 +1017,8 @@ local function tryDodge(part, threat, threats, isStatic)
     if d._attempted then return false end
     local now = os.clock()
     if now - d._lastGlobalDodge < d._globalCD then return false end
-    -- v14: backoff после серии noSpace
     if now < d._noSpaceUntil then return false end
 
-    -- v14: ставим флаг ДО дорогих вычислений
     d._attempted = true
 
     local ts = threatState[part]
@@ -942,7 +1044,6 @@ local function tryDodge(part, threat, threats, isStatic)
         ts.lastDodge = now; ts.lastDist = threat.dist
         d._noSpace += 1
         d._consecutiveNoSpace += 1
-        -- v14: прогрессивный backoff
         local backoff = NOSPACE_BACKOFF_SHORT
         if d._consecutiveNoSpace >= NOSPACE_THRESHOLD_LONG then
             backoff = NOSPACE_BACKOFF_LONG
@@ -987,7 +1088,7 @@ local spawnCheckQueued = false
 workspace.DescendantAdded:Connect(function(o)
     if not state.dodge.enabled then return end
     if not o:IsA("BasePart") then return end
-    if #pendingSpawn >= 30 then return end           -- v14: было 50
+    if #pendingSpawn >= 25 then return end
     pendingSpawn[#pendingSpawn + 1] = o
     if spawnCheckQueued then return end
     spawnCheckQueued = true
@@ -998,7 +1099,7 @@ workspace.DescendantAdded:Connect(function(o)
         if not myPos then return end
         local processed = 0
         for i = 1, #list do
-            if processed >= 10 then break end        -- v14: было 20
+            if processed >= 8 then break end
             local part = list[i]
             if part.Parent then
                 local dx = part.Position.X - myPos.X
@@ -1038,7 +1139,7 @@ workspace.DescendantAdded:Connect(function(o)
 end)
 
 --==================================================
--- HEARTBEAT (v14: единственный tryDodge, dodge первым)
+-- HEARTBEAT (v15: фиксированный тик доджа)
 --==================================================
 
 local function cleanupTables(now)
@@ -1058,176 +1159,6 @@ end
 
 RunService.Heartbeat:Connect(function()
     local now = os.clock()
-    state.dodge._attempted = false
-    state.dodge._underThreat = false
-
-    -- ==== DODGE (единственный tryDodge с best threat) ====
-    local d = state.dodge
-    if d.enabled then
-        local myPos = getMyPos()
-        local alive = not hum or hum.Health > 0
-        if myPos and alive then
-            -- health fallback (сразу через tryDodge, чтобы не дублировать)
-            local healthTriggered = false
-            if hum and d._lastHealth and hum.Health < d._lastHealth - 0.01 then
-                state.intel.liveSignals += 1
-                healthTriggered = true
-            end
-            if hum then d._lastHealth = hum.Health end
-
-            overlapParams.FilterDescendantsInstances = { char }
-            local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
-
-            -- v14: собираем ВСЕХ кандидатов в список, потом выбираем одного
-            local bestThreat, bestScore, bestPart = nil, 0, nil
-            local topThreats = { nil, nil, nil }
-            local topScores = { 0, 0, 0 }
-
-            -- priority 1: летящие
-            for i = 1, #parts do
-                local part = parts[i]
-                if part ~= primary then
-                    local tr = tracked[part]
-                    local vel
-                    if tr then
-                        local dt = now - tr.t
-                        if dt > 0.001 then vel = (part.Position - tr.pos) / dt end
-                        tr.pos = part.Position; tr.t = now; tr.lastSeen = now
-                    else
-                        tracked[part] = { pos = part.Position, t = now, lastSeen = now }
-                    end
-
-                    local physVel = part.AssemblyLinearVelocity
-                    local useVel = physVel
-                    if vel and vel.Magnitude > useVel.Magnitude then useVel = vel end
-
-                    if useVel.Magnitude >= 3 then
-                        local threat = analyzeThreat(part, myPos, useVel)
-                        if threat then
-                            d._underThreat = true
-                            local pri = 1
-                            if threat.type == "beam" then pri = 3
-                            elseif threat.type == "named" or threat.type == "tagged" then pri = 2 end
-                            if threat.tti < 0.6 or threat.approach > 0.2 or threat.dist < 20 then
-                                local sc = pri * 10 + (1 - math.min(threat.tti, 1))
-                                if sc > topScores[3] then
-                                    if sc > topScores[2] then
-                                        topThreats[3] = topThreats[2]; topScores[3] = topScores[2]
-                                        if sc > topScores[1] then
-                                            topThreats[2] = topThreats[1]; topScores[2] = topScores[1]
-                                            topThreats[1] = threat; topScores[1] = sc
-                                        else
-                                            topThreats[2] = threat; topScores[2] = sc
-                                        end
-                                    else
-                                        topThreats[3] = threat; topScores[3] = sc
-                                    end
-                                end
-                                if sc > bestScore then
-                                    bestThreat, bestScore, bestPart = threat, sc, part
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- priority 2: melee (только если летящих нет)
-            if not bestThreat then
-                for i = 1, #parts do
-                    local part = parts[i]
-                    if part.Name == "HumanoidRootPart" and part.Parent ~= char then
-                        local model = part.Parent
-                        if model and model ~= char then
-                            local eHum = model:FindFirstChildOfClass("Humanoid")
-                            if eHum and eHum.Health > 0 then
-                                local toPlayer = myPos - part.Position
-                                local dist = toPlayer.Magnitude
-                                if dist < 12 and dist > 0.1
-                                   and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
-                                    local fake = {partPos=part.Position, impact=part.Position,
-                                        vel=toPlayer, dist=dist, tti=0.1, mag=20,
-                                        partSize=4, halfDim=2, part=part}
-                                    bestThreat, bestScore, bestPart = fake, 5, part
-                                    break
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- priority 3: health-triggered emergency
-            if healthTriggered and not bestThreat then
-                local safe = findBestDodgePosition(myPos, nil, {}, "emergency")
-                if safe and applyDodge(safe) then
-                    d._dodges += 1; d._emergency += 1
-                    d._lastGlobalDodge = now
-                    d._consecutiveNoSpace = 0
-                    dodgeStats.Text = getStatsText()
-                end
-            end
-
-            -- ГЛАВНЫЙ: единственный tryDodge для лучшей угрозы
-            if bestThreat and not d._attempted then
-                state.intel.liveSignals += 1
-                local list = {}
-                for i = 1, 3 do if topThreats[i] then list[#list+1] = topThreats[i] end end
-                tryDodge(bestPart, bestThreat, list, false)
-            end
-
-            -- static zone (только если dodge ещё не пытался)
-            if not d._attempted and now - lastStaticCheck > 0.15 then  -- v14: было 0.05
-                lastStaticCheck = now
-                for i = 1, #parts do
-                    local part = parts[i]
-                    if part ~= primary and part.Parent then
-                        local dist = (part.Position - myPos).Magnitude
-                        if dist < 6.5 and isDangerPart(part) then
-                            local ts = threatState[part]
-                            if not ts or now - ts.lastDodge > 0.35 then
-                                local st = makeStaticThreat(part, myPos)
-                                if tryDodge(part, st, { st }, "zone") then break end
-                            end
-                        end
-                    end
-                end
-            end
-
-            -- touch (только если dodge ещё не пытался)
-            if not d._attempted and now - lastTouchCheck > 0.15 and primary then
-                lastTouchCheck = now
-                local ok, touching = pcall(function() return primary:GetTouchingParts() end)
-                if ok and touching then
-                    for i = 1, #touching do
-                        local tp = touching[i]
-                        if tp ~= primary and tp.Parent and isDangerPart(tp) then
-                            local st = makeStaticThreat(tp, myPos)
-                            if tryDodge(tp, st, { st }, "touch") then break end
-                        end
-                    end
-                end
-            end
-
-            -- spawn-track deferred (только если ещё не attempted)
-            if not d._attempted then
-                for part, tr in pairs(spawnTrack) do
-                    if part.Parent then
-                        local dt = now - tr.t
-                        if dt > 0.001 then
-                            local vel = (part.Position - tr.pos) / dt
-                            if vel.Magnitude >= 3 then
-                                local threat = analyzeThreat(part, myPos, vel)
-                                if threat and (threat.tti < 0.4 or threat.dist < 20) then
-                                    if tryDodge(part, threat, { threat }, false) then break end
-                                end
-                            end
-                        end
-                    end
-                end
-            end
-        end
-    end
 
     -- ==== FOLLOW ====
     local f = state.follow
@@ -1253,6 +1184,173 @@ RunService.Heartbeat:Connect(function()
         end
     end
 
+    -- ==== DODGE (фиксированный тик) ====
+    local d = state.dodge
+    if not d.enabled then return end
+    if now - d._dodgeTick < d._dodgeInterval then return end
+    d._dodgeTick = now
+    d._attempted = false
+    d._underThreat = false
+
+    local myPos = getMyPos()
+    local alive = not hum or hum.Health > 0
+    if not myPos or not alive then return end
+
+    -- health fallback
+    if hum and d._lastHealth and hum.Health < d._lastHealth - 0.01 then
+        state.intel.liveSignals += 1
+        if now - d._lastGlobalDodge >= d._globalCD and now >= d._noSpaceUntil then
+            local safe = findBestDodgePosition(myPos, nil, {}, "emergency")
+            if safe and applyDodge(safe) then
+                d._dodges += 1; d._emergency += 1
+                d._lastGlobalDodge = now
+                d._consecutiveNoSpace = 0
+                dodgeStats.Text = getStatsText()
+                f._pauseUntil = now + 0.5
+            end
+        end
+    end
+    if hum then d._lastHealth = hum.Health end
+
+    overlapParams.FilterDescendantsInstances = { char }
+    local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
+
+    local topThreats = { nil, nil, nil }
+    local topScores = { 0, 0, 0 }
+    local bestThreat, bestScore, bestPart = nil, 0, nil
+
+    for i = 1, #parts do
+        local part = parts[i]
+        if part ~= primary then
+            local tr = tracked[part]
+            local vel
+            if tr then
+                local dt = now - tr.t
+                if dt > 0.001 then vel = (part.Position - tr.pos) / dt end
+                tr.pos = part.Position; tr.t = now; tr.lastSeen = now
+            else
+                tracked[part] = { pos = part.Position, t = now, lastSeen = now }
+            end
+
+            local physVel = part.AssemblyLinearVelocity
+            local useVel = physVel
+            if vel and vel.Magnitude > useVel.Magnitude then useVel = vel end
+
+            if useVel.Magnitude >= 3 then
+                local threat = analyzeThreat(part, myPos, useVel)
+                if threat then
+                    d._underThreat = true
+                    local pri = 1
+                    if threat.type == "beam" then pri = 3
+                    elseif threat.type == "named" or threat.type == "tagged" then pri = 2 end
+                    if threat.tti < 0.6 or threat.approach > 0.2 or threat.dist < 20 then
+                        local sc = pri * 10 + (1 - math.min(threat.tti, 1))
+                        if sc > topScores[3] then
+                            if sc > topScores[2] then
+                                topThreats[3] = topThreats[2]; topScores[3] = topScores[2]
+                                if sc > topScores[1] then
+                                    topThreats[2] = topThreats[1]; topScores[2] = topScores[1]
+                                    topThreats[1] = threat; topScores[1] = sc
+                                else
+                                    topThreats[2] = threat; topScores[2] = sc
+                                end
+                            else
+                                topThreats[3] = threat; topScores[3] = sc
+                            end
+                        end
+                        if sc > bestScore then
+                            bestThreat, bestScore, bestPart = threat, sc, part
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- melee
+    if not bestThreat then
+        for i = 1, #parts do
+            local part = parts[i]
+            if part.Name == "HumanoidRootPart" and part.Parent ~= char then
+                local model = part.Parent
+                if model and model ~= char then
+                    local eHum = model:FindFirstChildOfClass("Humanoid")
+                    if eHum and eHum.Health > 0 then
+                        local toPlayer = myPos - part.Position
+                        local dist = toPlayer.Magnitude
+                        if dist < 12 and dist > 0.1
+                           and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
+                            local fake = {partPos=part.Position, impact=part.Position,
+                                vel=toPlayer, dist=dist, tti=0.1, mag=20,
+                                partSize=4, halfDim=2, part=part}
+                            bestThreat, bestScore, bestPart = fake, 5, part
+                            break
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    -- primary
+    if bestThreat and not d._attempted then
+        state.intel.liveSignals += 1
+        local list = {}
+        for i = 1, 3 do if topThreats[i] then list[#list+1] = topThreats[i] end end
+        tryDodge(bestPart, bestThreat, list, false)
+    end
+
+    -- static zone
+    if not d._attempted and now - lastStaticCheck > 0.15 then
+        lastStaticCheck = now
+        for i = 1, #parts do
+            local part = parts[i]
+            if part ~= primary and part.Parent then
+                local dist = (part.Position - myPos).Magnitude
+                if dist < 6.5 and isDangerPart(part) then
+                    local ts = threatState[part]
+                    if not ts or now - ts.lastDodge > 0.35 then
+                        local st = makeStaticThreat(part, myPos)
+                        if tryDodge(part, st, { st }, "zone") then break end
+                    end
+                end
+            end
+        end
+    end
+
+    -- touch
+    if not d._attempted and now - lastTouchCheck > 0.15 and primary then
+        lastTouchCheck = now
+        local ok, touching = pcall(function() return primary:GetTouchingParts() end)
+        if ok and touching then
+            for i = 1, #touching do
+                local tp = touching[i]
+                if tp ~= primary and tp.Parent and isDangerPart(tp) then
+                    local st = makeStaticThreat(tp, myPos)
+                    if tryDodge(tp, st, { st }, "touch") then break end
+                end
+            end
+        end
+    end
+
+    -- spawn-track
+    if not d._attempted then
+        for part, tr in pairs(spawnTrack) do
+            if part.Parent then
+                local dt = now - tr.t
+                if dt > 0.001 then
+                    local vel = (part.Position - tr.pos) / dt
+                    if vel.Magnitude >= 3 then
+                        local threat = analyzeThreat(part, myPos, vel)
+                        if threat and (threat.tti < 0.4 or threat.dist < 20) then
+                            if tryDodge(part, threat, { threat }, false) then break end
+                        end
+                    end
+                end
+            end
+        end
+    end
+
     -- cleanup
     if now - trackLastCleanup > 0.8 then
         trackLastCleanup = now
@@ -1265,8 +1363,8 @@ RunService.Heartbeat:Connect(function()
             bodyLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
         end
         perfLabel.Text = string.format("noSpace: %d · consec: %d · peak: %d",
-            state.dodge._noSpace, state.dodge._consecutiveNoSpace, state.dodge._peakTried)
-        if state.dodge._consecutiveNoSpace >= NOSPACE_THRESHOLD_SHORT then
+            d._noSpace, d._consecutiveNoSpace, d._peakTried)
+        if d._consecutiveNoSpace >= NOSPACE_THRESHOLD_SHORT then
             perfLabel.TextColor3 = Color3.fromRGB(255, 200, 80)
         else
             perfLabel.TextColor3 = Color3.fromRGB(150, 200, 255)
@@ -1470,9 +1568,11 @@ UIS.InputBegan:Connect(function(input, processed)
         scanWorkspace(); refreshPartList()
     elseif input.KeyCode == Enum.KeyCode.H then
         setHover(not state.dodge.hoverEnabled)
+    elseif input.KeyCode == Enum.KeyCode.G then
+        applyGfx()
     end
 end)
 
 switchTab("parts"); scanWorkspace(); refreshPartList(); dodgeStats.Text = getStatsText()
 
-print("[FNVB] v14 loaded OK — batched best-only")
+print("[FNVB] v15 loaded OK — 40Hz dodge + LOW GFX")
