@@ -1,7 +1,7 @@
 -- language: Luau, file: FNV_Builder.client.lua, target: Roblox Studio
--- v7: hover-freeze (H key), fast dodge (velocity zero + CFrame), tiered validation, single Heartbeat.
+-- v8: velocity passthrough (CFrame-projectiles), projectile-aware wall check, always-4-dir fallback, auto distance.
 
-print("[FNVB] loading v7...")
+print("[FNVB] loading v8...")
 
 local Players, UIS, RunService, RS =
     game:GetService("Players"), game:GetService("UserInputService"),
@@ -29,38 +29,49 @@ local function nameIsAttack(name)
     return false
 end
 
+local CARDINAL = {
+    Vector3.new(1, 0, 0), Vector3.new(-1, 0, 0),
+    Vector3.new(0, 0, 1), Vector3.new(0, 0, -1),
+}
+
 --==================================================
 -- STATE
 --==================================================
 
 local state = {
     dodge = {
-        enabled     = false,
-        dodgeDist   = 14,
-        reactRadius = 55,
-        safeMargin  = 2.5,
-        hoverEnabled = false,   -- v7: застывание
-        _lastHealth = nil,
-        _dodges     = 0,
-        _refused    = 0,
-        _reEngage   = 0,
-        _emergency  = 0,
+        enabled      = false,
+        hoverEnabled = false,
+        reactRadius  = 55,
+        autoMinDist  = 8,
+        autoMaxDist  = 30,
+        _lastHealth  = nil,
+        _dodges      = 0,
+        _refused     = 0,
+        _emergency   = 0,
+        _reEngage    = 0,
+        _calibN      = 0,
+        _calibSpeed  = 0,
+        _avgSpeed    = 30,
     },
-    follow = {
-        enabled = false, targetName = "",
-        offset = Vector3.new(0, 5, 0),
-        _target = nil, _lastPos = nil,
-    },
-    parts = { filter = "", showAnchoredOnly = false, maxList = 200, _list = {} },
-    intel = { liveSignals = 0 },
+    follow = { enabled = false, targetName = "", offset = Vector3.new(0, 5, 0),
+               _target = nil, _lastPos = nil },
+    parts  = { filter = "", showAnchoredOnly = false, maxList = 200, _list = {} },
+    intel  = { liveSignals = 0 },
 }
 
 --==================================================
--- CACHED CHARACTER + HOVER REFS
+-- CHARACTER + HOVER
 --==================================================
 
 local char, hrp, hum = nil, nil, nil
 local hoverAtt, hoverLV, hoverAO = nil, nil, nil
+
+local function clearHoverInstances()
+    if hoverLV then hoverLV:Destroy(); hoverLV = nil end
+    if hoverAO then hoverAO:Destroy(); hoverAO = nil end
+    if hoverAtt then hoverAtt:Destroy(); hoverAtt = nil end
+end
 
 local function updateHover()
     if not char or not hrp or not hum then return end
@@ -71,7 +82,6 @@ local function updateHover()
         end
         if not hoverLV or not hoverLV.Parent then
             hoverLV = Instance.new("LinearVelocity")
-            hoverLV.Name = "FNV_HoverLV"
             hoverLV.Attachment0 = hoverAtt
             hoverLV.VectorVelocity = Vector3.zero
             hoverLV.MaxForce = math.huge
@@ -80,7 +90,6 @@ local function updateHover()
         end
         if not hoverAO or not hoverAO.Parent then
             hoverAO = Instance.new("AlignOrientation")
-            hoverAO.Name = "FNV_HoverAO"
             hoverAO.Mode = Enum.OrientationAlignmentMode.OneAttachment
             hoverAO.Attachment0 = hoverAtt
             hoverAO.CFrame = hrp.CFrame
@@ -90,13 +99,12 @@ local function updateHover()
         end
         hum.PlatformStand = true
     else
-        if hoverLV then hoverLV:Destroy(); hoverLV = nil end
-        if hoverAO then hoverAO:Destroy(); hoverAO = nil end
-        if hoverAtt then hoverAtt:Destroy(); hoverAtt = nil end
+        clearHoverInstances()
         if hum and hum.Parent then hum.PlatformStand = false end
     end
 end
 
+local hoverBtn
 local function setHover(on)
     state.dodge.hoverEnabled = on
     updateHover()
@@ -109,25 +117,16 @@ end
 
 local function updateChar(c)
     char = c; hrp, hum = nil, nil
-    if hoverLV then hoverLV:Destroy(); hoverLV = nil end
-    if hoverAO then hoverAO:Destroy(); hoverAO = nil end
-    if hoverAtt then hoverAtt:Destroy(); hoverAtt = nil end
+    clearHoverInstances()
     if c then
         hrp = c:FindFirstChild("HumanoidRootPart") or c:WaitForChild("HumanoidRootPart", 5)
         hum = c:FindFirstChildOfClass("Humanoid") or c:WaitForChild("Humanoid", 5)
         if hum then state.dodge._lastHealth = hum.Health end
-        if state.dodge.hoverEnabled then
-            task.defer(updateHover)
-        end
+        if state.dodge.hoverEnabled then task.defer(updateHover) end
     end
 end
 player.CharacterAdded:Connect(updateChar)
-player.CharacterRemoving:Connect(function()
-    if hoverLV then hoverLV:Destroy(); hoverLV = nil end
-    if hoverAO then hoverAO:Destroy(); hoverAO = nil end
-    if hoverAtt then hoverAtt:Destroy(); hoverAtt = nil end
-    char, hrp, hum = nil, nil, nil
-end)
+player.CharacterRemoving:Connect(function() clearHoverInstances(); char, hrp, hum = nil, nil, nil end)
 if player.Character then updateChar(player.Character) end
 
 --==================================================
@@ -166,7 +165,7 @@ local function mkToggle(parent, text, pos, size, getter, setter)
 end
 
 --==================================================
--- GUI
+-- MAIN GUI
 --==================================================
 
 local gui = Instance.new("ScreenGui")
@@ -175,7 +174,7 @@ gui.IgnoreGuiInset = true; gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
 gui.DisplayOrder = 50; gui.Parent = playerGui
 
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(280, 360)
+frame.Size = UDim2.fromOffset(280, 380)
 frame.Position = UDim2.new(0, 20, 0.08, 0)
 frame.BackgroundColor3 = Color3.fromRGB(18, 18, 25)
 frame.BorderSizePixel = 0; frame.Active = true
@@ -186,7 +185,7 @@ outline.Color = Color3.fromRGB(255, 40, 65); outline.Thickness = 1.5; outline.Pa
 
 local header = Instance.new("Frame")
 header.Size = UDim2.new(1, 0, 0, 26); header.BackgroundTransparency = 1; header.Parent = frame
-local dragBar = mkBtn(header, "FNVB7",
+local dragBar = mkBtn(header, "FNVB8",
     UDim2.fromOffset(6, 0), UDim2.new(0, 50, 1, 0), Color3.fromRGB(0, 0, 0))
 dragBar.BackgroundTransparency = 1; dragBar.TextColor3 = Color3.fromRGB(255, 55, 80)
 dragBar.TextXAlignment = Enum.TextXAlignment.Left; dragBar.TextSize = 12
@@ -216,7 +215,8 @@ local function makeTab(text, key)
 end
 makeTab("PARTS", "parts"); makeTab("DODGE", "dodge"); makeTab("FOLLOW", "follow")
 
-local closeBtn = mkBtn(header, "✕", UDim2.new(1, -22, 0, 4), UDim2.fromOffset(18, 18), Color3.fromRGB(80, 20, 30))
+local closeBtn = mkBtn(header, "✕", UDim2.new(1, -22, 0, 4),
+    UDim2.fromOffset(18, 18), Color3.fromRGB(80, 20, 30))
 closeBtn.TextSize = 12; closeBtn.ZIndex = 5
 
 local content = Instance.new("ScrollingFrame")
@@ -225,7 +225,6 @@ content.BackgroundTransparency = 1; content.BorderSizePixel = 0
 content.ScrollBarThickness = 2; content.ScrollBarImageColor3 = Color3.fromRGB(120, 25, 45)
 content.CanvasSize = UDim2.new(); content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 content.ClipsDescendants = true; content.Parent = frame
-
 local cp = Instance.new("UIPadding")
 cp.PaddingTop = UDim.new(0, 3); cp.PaddingLeft = UDim.new(0, 5)
 cp.PaddingRight = UDim.new(0, 5); cp.PaddingBottom = UDim.new(0, 4); cp.Parent = content
@@ -275,7 +274,7 @@ lp.PaddingRight = UDim.new(0, 2); lp.PaddingBottom = UDim.new(0, 3); lp.Parent =
 local function teleportTo(part)
     if not part or not part.Parent or not char then return end
     local ok = pcall(function() char:PivotTo(CFrame.new(part.Position + Vector3.new(0, 5, 0))) end)
-    if hrp then
+    if ok and hrp then
         hrp.AssemblyLinearVelocity = Vector3.zero
         hrp.AssemblyAngularVelocity = Vector3.zero
     end
@@ -304,10 +303,13 @@ function refreshPartList()
         local row = Instance.new("Frame")
         row.LayoutOrder = i; row.Size = UDim2.new(1, -2, 0, 20)
         row.BackgroundTransparency = 1; row.Parent = partList
-        local nb = mkBtn(row, part.Name, UDim2.fromOffset(0, 0), UDim2.new(1, -34, 0, 20), Color3.fromRGB(48, 48, 60), Enum.Font.Gotham)
-        nb.TextSize = 10; nb.TextXAlignment = Enum.TextXAlignment.Left; nb.TextTruncate = Enum.TextTruncate.AtEnd
+        local nb = mkBtn(row, part.Name, UDim2.fromOffset(0, 0), UDim2.new(1, -34, 0, 20),
+            Color3.fromRGB(48, 48, 60), Enum.Font.Gotham)
+        nb.TextSize = 10; nb.TextXAlignment = Enum.TextXAlignment.Left
+        nb.TextTruncate = Enum.TextTruncate.AtEnd
         nb.Activated:Connect(function() teleportTo(part) end)
-        local tpBtn = mkBtn(row, "ТП", UDim2.new(1, -32, 0, 0), UDim2.fromOffset(30, 20), Color3.fromRGB(120, 25, 45))
+        local tpBtn = mkBtn(row, "ТП", UDim2.new(1, -32, 0, 0), UDim2.fromOffset(30, 20),
+            Color3.fromRGB(120, 25, 45))
         tpBtn.TextSize = 10; tpBtn.Activated:Connect(function() teleportTo(part) end)
     end
 end
@@ -332,45 +334,38 @@ end)
 -- DODGE PANEL
 --==================================================
 
-local panelDodge = makePanel("dodge", 560)
+local panelDodge = makePanel("dodge", 500)
 
-mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v7", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
+mkToggle(panelDodge, "АВТО-УКЛОНЕНИЕ v8", UDim2.fromOffset(0, 0), UDim2.new(1, 0, 0, 20),
     function() return state.dodge.enabled end,
     function(v) state.dodge.enabled = v end)
 
--- HOVER BUTTON
-local hoverBtn = mkBtn(panelDodge, "○ ЗАСТЫТЬ В ВОЗДУХЕ [H]",
+hoverBtn = mkBtn(panelDodge, "○ ЗАСТЫТЬ В ВОЗДУХЕ [H]",
     UDim2.fromOffset(0, 24), UDim2.new(1, 0, 0, 22),
     Color3.fromRGB(48, 48, 60), Enum.Font.Gotham); hoverBtn.TextSize = 10
 hoverBtn.Activated:Connect(function() setHover(not state.dodge.hoverEnabled) end)
 
-local function stepper(parent, y, labelText, getter, setter, min, max, step, fmt)
-    mkLabel(parent, labelText, UDim2.fromOffset(0, y), UDim2.new(1, 0, 0, 12)).TextSize = 10
-    fmt = fmt or tostring
-    local val = mkLabel(parent, fmt(getter()), UDim2.fromOffset(0, y + 14), UDim2.new(1, -50, 0, 18))
-    val.TextColor3 = Color3.fromRGB(255, 200, 80); val.TextSize = 10
-    mkBtn(parent, "−", UDim2.new(1, -46, 0, y + 14), UDim2.fromOffset(22, 18))
-        .Activated:Connect(function() setter(math.max(min, getter() - step)); val.Text = fmt(getter()) end)
-    mkBtn(parent, "+", UDim2.new(1, -22, 0, y + 14), UDim2.fromOffset(22, 18))
-        .Activated:Connect(function() setter(math.min(max, getter() + step)); val.Text = fmt(getter()) end)
-    return val
-end
-
-stepper(panelDodge, 54, "Дистанция рывка (studs):",
-    function() return state.dodge.dodgeDist end,
-    function(v) state.dodge.dodgeDist = v end, 4, 60, 2)
-
-local dodgeStats = mkLabel(panelDodge, "рывков: 0 · отказов: 0 · срочных: 0 · сигналов: 0",
-    UDim2.fromOffset(0, 92), UDim2.new(1, 0, 0, 14))
+local dodgeStats = mkLabel(panelDodge,
+    "рывков: 0 · срочных: 0 · отказов: 0 · пере-рывков: 0",
+    UDim2.fromOffset(0, 54), UDim2.new(1, 0, 0, 14))
 dodgeStats.TextColor3 = Color3.fromRGB(150, 255, 180); dodgeStats.TextSize = 10
 
-mkLabel(panelDodge, "— INTEL —", UDim2.fromOffset(0, 112), UDim2.new(1, 0, 0, 12),
+local distLabel = mkLabel(panelDodge, "авто-дистанция: ~14 studs",
+    UDim2.fromOffset(0, 72), UDim2.new(1, 0, 0, 14))
+distLabel.TextColor3 = Color3.fromRGB(255, 200, 80); distLabel.TextSize = 10
+
+local errLabel = mkLabel(panelDodge, "ERR: нет",
+    UDim2.fromOffset(0, 90), UDim2.new(1, 0, 0, 12))
+errLabel.TextColor3 = Color3.fromRGB(150, 200, 150); errLabel.TextSize = 9
+
+mkLabel(panelDodge, "— INTEL —", UDim2.fromOffset(0, 110), UDim2.new(1, 0, 0, 12),
     Enum.TextXAlignment.Center).TextColor3 = Color3.fromRGB(255, 100, 130)
-local intelStatus = mkLabel(panelDodge, "не сканировано", UDim2.fromOffset(0, 126), UDim2.new(1, 0, 0, 14))
+local intelStatus = mkLabel(panelDodge, "не сканировано",
+    UDim2.fromOffset(0, 124), UDim2.new(1, 0, 0, 14))
 intelStatus.TextColor3 = Color3.fromRGB(150, 200, 255); intelStatus.TextSize = 10
 
 local intelList = Instance.new("Frame")
-intelList.Position = UDim2.fromOffset(0, 144); intelList.Size = UDim2.new(1, 0, 0, 160)
+intelList.Position = UDim2.fromOffset(0, 142); intelList.Size = UDim2.new(1, 0, 0, 160)
 intelList.BackgroundColor3 = Color3.fromRGB(28, 28, 37); intelList.BorderSizePixel = 0
 intelList.Parent = panelDodge; corner(intelList, 4)
 local intelScroll = Instance.new("ScrollingFrame")
@@ -382,22 +377,25 @@ local intelLL = Instance.new("UIListLayout")
 intelLL.Padding = UDim.new(0, 1); intelLL.SortOrder = Enum.SortOrder.LayoutOrder; intelLL.Parent = intelScroll
 
 local scanScriptsBtn = mkBtn(panelDodge, "СКАН СКРИПТЫ + РЕМОУТЫ",
-    UDim2.fromOffset(0, 312), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
+    UDim2.fromOffset(0, 310), UDim2.new(1, 0, 0, 20)); scanScriptsBtn.TextSize = 10
 
 mkLabel(panelDodge,
-    "v7: Hover = застыть в воздухе. Dodge мгновенный (velocity обнуляется после рывка). Три уровня валидации: близкая угроза — рывок без проверок, дальняя — полная.",
-    UDim2.fromOffset(0, 336), UDim2.new(1, 0, 0, 70)).TextSize = 9
+    "v8: velocity прокидывается из дельта-трекера (ловит CFrame-атаки). wallClear игнорирует сами снаряды. Приоритет: от снаряда → от impact → перпендикуляр → кардинал. Вертикаль — только если всё заложено.",
+    UDim2.fromOffset(0, 334), UDim2.new(1, 0, 0, 90)).TextSize = 9
 
 --==================================================
--- ENGINE REFS
+-- ENGINE PARAMS
 --==================================================
 
 local overlapParams = OverlapParams.new()
 overlapParams.FilterType = Enum.RaycastFilterType.Exclude
-overlapParams.MaxParts = 20     -- v7: 20 вместо 40, быстрее
+overlapParams.MaxParts = 30
 
-local envParams = RaycastParams.new()
-envParams.FilterType = Enum.RaycastFilterType.Exclude
+local wallParams = RaycastParams.new()
+wallParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local floorParams = RaycastParams.new()
+floorParams.FilterType = Enum.RaycastFilterType.Exclude
 
 local threatParams = OverlapParams.new()
 threatParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -408,30 +406,34 @@ local tracked = {}
 local trackLastCleanup = 0
 local TRACK_TTL = 0.4
 
+-- error tracking
+local errCount, lastErr = 0, ""
+
 local function getStatsText()
     local d = state.dodge
-    return string.format("рывков: %d · отказов: %d · срочных: %d · сигналов: %d",
-        d._dodges, d._refused, d._emergency, state.intel.liveSignals)
+    return string.format("рывков: %d · срочных: %d · отказов: %d · пере-рывков: %d",
+        d._dodges, d._emergency, d._refused, d._reEngage)
 end
 
 --==================================================
--- THREAT CLASSIFY + ANALYZE
+-- CLASSIFY + ANALYZE (with velocity passthrough)
 --==================================================
 
 local function classifyThreat(part)
     if part:FindFirstChildWhichIsA("Beam") then return "beam" end
     if part:FindFirstChildWhichIsA("ParticleEmitter")
-       or part:FindFirstChildWhichIsA("Trail")
-       or part:FindFirstChildWhichIsA("Fire") then return "vfx" end
+        or part:FindFirstChildWhichIsA("Trail")
+        or part:FindFirstChildWhichIsA("Fire") then return "vfx" end
     if nameIsAttack(part.Name) then return "named" end
-    if part.Size.Magnitude < 6 and not part.Anchored then return "projectile" end
+    if part.Size.Magnitude < 8 and not part.Anchored then return "projectile" end
     return "projectile"
 end
 
-local function analyzeThreat(part, myPos)
-    local vel = part.AssemblyLinearVelocity
+-- v8: velOverride — передаём из дельта-трекера
+local function analyzeThreat(part, myPos, velOverride)
+    local vel = velOverride or part.AssemblyLinearVelocity
     local mag = vel.Magnitude
-    if mag < 6 then return nil end
+    if mag < 5 then return nil end
     local toMe = myPos - part.Position
     local dist = toMe.Magnitude
     if dist < 0.5 then return nil end
@@ -441,141 +443,207 @@ local function analyzeThreat(part, myPos)
     if closing <= 0.1 then return nil end
     local tti = dist / closing
 
-    local sizeBoost = math.clamp(part.Size.Magnitude / 6, 0.5, 2.0)
-    local speedBoost = 1 + math.clamp(mag / 100, 0, 1) * 0.8
-    local distOut = state.dodge.dodgeDist * sizeBoost * speedBoost
+    -- калибровка средней скорости
+    local d = state.dodge
+    d._calibN += 1; d._calibSpeed += mag
+    if d._calibN >= 25 then
+        d._avgSpeed = d._calibSpeed / d._calibN
+        d._calibN = 0; d._calibSpeed = 0
+    end
 
     return {
         tti = tti,
         impact = part.Position + vel * tti,
-        vel = vel, dist = dist, approach = approach, mag = mag,
-        dodgeDist = math.min(distOut, 45),
+        partPos = part.Position,
+        vel = vel,
+        dist = dist,
+        approach = approach,
+        mag = mag,
+        partSize = part.Size.Magnitude,
         type = classifyThreat(part),
     }
 end
 
 --==================================================
--- FAST DODGE POSITION — tiered validation
+-- AUTO DISTANCE
 --==================================================
 
-local function hasFloor(pos)
-    return workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -12, 0), envParams) ~= nil
+local function computeAutoDist(threat)
+    if not threat then return 14 end
+    local d = state.dodge
+    local base = 10
+    base += math.min(threat.partSize or 5, 20) * 0.35
+    base += math.min((threat.mag or 0) / 100, 2.5) * 4
+    if threat.tti and threat.tti < 0.15 then base *= 1.35 end
+    return math.clamp(base, d.autoMinDist, d.autoMaxDist)
 end
 
--- уровень 1: только стена (самое дешёвое)
+--==================================================
+-- WALL / FLOOR / FULL SAFE
+--==================================================
+
+-- снаряд — не стена
+local function isRealWall(hitPart)
+    if not hitPart or not hitPart.Parent then return false end
+    if char and hitPart:IsDescendantOf(char) then return false end
+    if hitPart.Size.Magnitude < 8 then return false end
+    if nameIsAttack(hitPart.Name) then return false end
+    if hitPart:FindFirstChildWhichIsA("ParticleEmitter")
+        or hitPart:FindFirstChildWhichIsA("Beam")
+        or hitPart:FindFirstChildWhichIsA("Trail")
+        or hitPart:FindFirstChildWhichIsA("Fire") then return false end
+    return true
+end
+
 local function wallClear(pos)
     if not hrp then return true end
-    envParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
+    wallParams.FilterDescendantsInstances = { char, workspace.CurrentCamera }
     local d = pos - hrp.Position
     if d.Magnitude < 0.1 then return true end
-    return workspace:Raycast(hrp.Position, d, envParams) == nil
+    local hit = workspace:Raycast(hrp.Position, d, wallParams)
+    if not hit then return true end
+    return not isRealWall(hit.Instance)
 end
 
--- уровень 2: стена + пол + чужие атаки
+local function hasFloor(pos)
+    floorParams.FilterDescendantsInstances = { char }
+    return workspace:Raycast(pos + Vector3.new(0, 0.5, 0), Vector3.new(0, -20, 0), floorParams) ~= nil
+end
+
 local function fullSafe(pos)
     if not wallClear(pos) then return false end
-    if not hasFloor(pos) then return false end
+    -- пол проверяем только если стоим на земле
+    if hum and hum.FloorMaterial ~= Enum.Material.Air then
+        if not hasFloor(pos) then return false end
+    end
     threatParams.FilterDescendantsInstances = { char }
-    local parts = workspace:GetPartBoundsInRadius(pos, state.dodge.safeMargin, threatParams)
+    local parts = workspace:GetPartBoundsInRadius(pos, 2.5, threatParams)
     for _, p in ipairs(parts) do
         if not p:IsDescendantOf(char) then
             local cls = classifyThreat(p)
-            if cls and (cls == "beam" or cls == "vfx" or nameIsAttack(p.Name)
-                or (p.Size.Magnitude < 6 and not p.Anchored)) then
-                return false
-            end
+            if cls == "beam" or cls == "vfx" or nameIsAttack(p.Name) then return false end
         end
     end
     return true
 end
 
--- построить базовые направления (от точки удара, перпендикуляр к скорости)
-local function baseDirs(myPos, threat)
-    local bases = {}
-    if threat and threat.impact then
-        local a = Vector3.new(myPos.X - threat.impact.X, 0, myPos.Z - threat.impact.Z)
-        if a.Magnitude > 0.1 then bases[#bases + 1] = a.Unit end
+--==================================================
+-- BUILD BASES (направления)
+--==================================================
+
+local function buildBases(myPos, threat)
+    local bases, seen = {}, {}
+    local function add(v)
+        if not v then return end
+        v = Vector3.new(v.X, 0, v.Z)
+        if v.Magnitude < 0.05 then return end
+        v = v.Unit
+        local k = string.format("%.2f_%.2f", v.X, v.Z)
+        if seen[k] then return end
+        seen[k] = true
+        bases[#bases + 1] = v
     end
-    if threat and threat.vel and threat.vel.Magnitude > 0.1 then
-        local v = Vector3.new(threat.vel.X, 0, threat.vel.Z)
-        if v.Magnitude > 0.1 then
-            v = v.Unit
-            bases[#bases + 1] = Vector3.new(-v.Z, 0, v.X)
-            bases[#bases + 1] = Vector3.new(v.Z, 0, -v.X)
+    if threat then
+        -- 1) ОТ СНАРЯДА (главное — даже если impact ≈ player)
+        if threat.partPos then add(myPos - threat.partPos) end
+        -- 2) от предсказанной точки удара
+        if threat.impact then add(myPos - threat.impact) end
+        -- 3) перпендикуляры к скорости
+        if threat.vel and threat.vel.Magnitude > 0.1 then
+            local v = Vector3.new(threat.vel.X, 0, threat.vel.Z)
+            if v.Magnitude > 0.1 then
+                v = v.Unit
+                add(Vector3.new(-v.Z, 0, v.X))
+                add(Vector3.new(v.Z, 0, -v.X))
+                -- 4) назад вдоль скорости
+                add(-v)
+            end
         end
     end
-    if #bases == 0 then
-        local a = math.random() * math.pi * 2
-        bases[1] = Vector3.new(math.cos(a), 0, math.sin(a))
-    end
+    -- всегда добавляем 4 кардинала как fallback (дедуп через seen)
+    for _, c in ipairs(CARDINAL) do add(c) end
     return bases
 end
 
--- v7: по уровню urgency
+--==================================================
+-- FIND SAFE POSITION — v8 гарантирует горизонталь
+--==================================================
+
 local function findSafeDodgePosition(myPos, threat, urgency)
-    -- urgency: "emergency" | "fast" | "normal"
-    local dd = threat and threat.dodgeDist or state.dodge.dodgeDist
-    local bases = baseDirs(myPos, threat)
+    local dd = computeAutoDist(threat)
+    local bases = buildBases(myPos, threat)
 
     if urgency == "emergency" then
-        -- 1-2 кандидата, стена-only, никаких пола/атак
-        for i = 1, math.min(#bases, 2) do
-            local pos = myPos + bases[i] * dd
-            if wallClear(pos) then return pos end
+        -- пробуем ВСЕ базы, wallClear only
+        for _, b in ipairs(bases) do
+            local p = myPos + b * dd
+            if wallClear(p) then return p, dd end
         end
-        -- совсем плохо — вертикально вверх
-        return myPos + Vector3.new(0, dd * 0.7, 0)
+        -- половина дистанции
+        for _, b in ipairs(bases) do
+            local p = myPos + b * (dd * 0.6)
+            if wallClear(p) then return p, dd * 0.6 end
+        end
+        -- совсем последний шанс: кардинал full
+        for _, c in ipairs(CARDINAL) do
+            local p = myPos + c * dd
+            if wallClear(p) then return p, dd end
+        end
+        -- вертикаль — только если реально зажат
+        return nil
     elseif urgency == "fast" then
-        -- 3 кандидата: стена + пол (без атак в точке)
-        for i = 1, math.min(#bases, 3) do
-            local pos = myPos + bases[i] * dd
-            if wallClear(pos) and hasFloor(pos) then return pos end
+        for _, b in ipairs(bases) do
+            local p = myPos + b * dd
+            if wallClear(p) then return p, dd end
         end
-        -- fallback: только стена
-        for i = 1, math.min(#bases, 3) do
-            local pos = myPos + bases[i] * dd
-            if wallClear(pos) then return pos end
+        -- кардинал fallback
+        for _, c in ipairs(CARDINAL) do
+            local p = myPos + c * dd
+            if wallClear(p) then return p, dd end
         end
         return nil
     else
-        -- normal: 5 кандидатов, полная проверка
-        local seen, out = {}, {}
+        -- normal: веер ±45° вокруг каждой базы + кардиналы
         for _, b in ipairs(bases) do
-            for angle = -30, 30, 30 do
+            for angle = -45, 45, 15 do
                 local rot = CFrame.Angles(0, math.rad(angle), 0)
-                local d = rot * b
-                d = Vector3.new(d.X, 0, d.Z)
-                if d.Magnitude > 0.01 then
-                    d = d.Unit
-                    local key = string.format("%.1f_%.1f", d.X, d.Z)
-                    if not seen[key] then seen[key] = true; out[#out + 1] = d end
+                local dir = rot * b
+                dir = Vector3.new(dir.X, 0, dir.Z)
+                if dir.Magnitude > 0.01 then
+                    local p = myPos + dir.Unit * dd
+                    if fullSafe(p) then return p, dd end
                 end
-                if #out >= 5 then break end
             end
-            if #out >= 5 then break end
         end
-        for _, d in ipairs(out) do
-            local pos = myPos + d * dd
-            if fullSafe(pos) then return pos end
+        -- кардинал без веера
+        for _, c in ipairs(CARDINAL) do
+            local p = myPos + c * dd
+            if fullSafe(p) then return p, dd end
         end
         return nil
     end
 end
 
 --==================================================
--- APPLY DODGE — v7: velocity zero (ключевой фикс)
+-- APPLY DODGE
 --==================================================
 
 local function applyDodge(safePos, type)
     if not char or not hrp then return false end
-    local ok = pcall(function() char:PivotTo(CFrame.new(safePos)) end)
-    if ok then
-        -- КРИТИЧНО: обнулить скорость, чтобы не улететь обратно в хитбокс
-        hrp.AssemblyLinearVelocity = Vector3.zero
-        hrp.AssemblyAngularVelocity = Vector3.zero
-        return true
+    local ok, err = pcall(function() char:PivotTo(CFrame.new(safePos)) end)
+    if not ok then
+        errCount += 1
+        if lastErr == "" then
+            lastErr = tostring(err):sub(1, 50)
+            errLabel.Text = "ERR(" .. errCount .. "): " .. lastErr
+            errLabel.TextColor3 = Color3.fromRGB(255, 100, 100)
+        end
+        return false
     end
-    return false
+    -- КРИТИЧНО: стоп физику
+    hrp.AssemblyLinearVelocity = Vector3.zero
+    hrp.AssemblyAngularVelocity = Vector3.zero
+    return true
 end
 
 local function registerDodge(type)
@@ -586,7 +654,7 @@ local function registerDodge(type)
 end
 
 --==================================================
--- TRY DODGE — per-threat cooldown + urgency check
+-- TRY DODGE
 --==================================================
 
 local function tryDodge(part, threat)
@@ -595,21 +663,19 @@ local function tryDodge(part, threat)
     local ts = threatState[part]
     if not ts then ts = { lastDodge = 0, lastDist = 999 } end
 
-    -- per-threat cooldown: 0.05с emergency, 0.10с normal
     local urgency
     if threat.tti < 0.10 then urgency = "emergency"
     elseif threat.tti < 0.20 then urgency = "fast"
     else urgency = "normal" end
 
-    local cd = (urgency == "emergency") and 0.05 or 0.10
+    local cd = (urgency == "emergency") and 0.04 or 0.08
     if now - ts.lastDodge < cd then return false end
 
-    -- пере-рывок логика
     if ts.lastDodge > 0 and threat.dist < ts.lastDist - 0.5 then
         state.dodge._reEngage += 1
     end
 
-    local safe = findSafeDodgePosition(hrp.Position, threat, urgency)
+    local safe, usedDist = findSafeDodgePosition(hrp.Position, threat, urgency)
     if not safe then
         ts.lastDodge = now; ts.lastDist = threat.dist
         threatState[part] = ts
@@ -622,6 +688,8 @@ local function tryDodge(part, threat)
     ts.lastDodge = now; ts.lastDist = threat.dist
     threatState[part] = ts
     registerDodge(urgency)
+    -- обновляем инфо-лейбл авто-дистанции
+    distLabel.Text = string.format("авто-дистанция: ~%.0f studs", usedDist or 14)
     return true
 end
 
@@ -632,6 +700,7 @@ end
 local pendingSpawn = {}
 local spawnCheckQueued = false
 local lastSpawnDodge = {}
+local spawnTrack = {}
 
 workspace.DescendantAdded:Connect(function(o)
     if not state.dodge.enabled then return end
@@ -653,18 +722,19 @@ workspace.DescendantAdded:Connect(function(o)
                         or part:FindFirstChildWhichIsA("Beam")
                         or part:FindFirstChildWhichIsA("Trail")
                         or part:FindFirstChildWhichIsA("Fire")
-                        or (part.Size.Magnitude < 6 and not part.Anchored)
                     if hot then
                         local now = os.clock()
                         if now - (lastSpawnDodge[part] or 0) > 0.10 then
                             lastSpawnDodge[part] = now
                             state.intel.liveSignals += 1
-                            local threat = analyzeThreat(part, myPos) or {
-                                dodgeDist = state.dodge.dodgeDist,
-                                dist = dist, impact = part.Position,
-                                vel = Vector3.zero, tti = 0,
-                            }
-                            tryDodge(part, threat)
+                            -- первый анализ: если velocity=0 (CFrame), ждём дельту
+                            local threat = analyzeThreat(part, myPos)
+                            if threat then
+                                tryDodge(part, threat)
+                            else
+                                -- частый случай: anchored+CFrame → ждём следующего кадра для дельты
+                                spawnTrack[part] = { pos = part.Position, t = now }
+                            end
                         end
                     end
                     tracked[part] = { pos = part.Position, t = os.clock(), lastSeen = os.clock() }
@@ -675,7 +745,7 @@ workspace.DescendantAdded:Connect(function(o)
 end)
 
 --==================================================
--- SINGLE HEARTBEAT — dodge + follow merged
+-- HEARTBEAT (dodge + follow)
 --==================================================
 
 RunService.Heartbeat:Connect(function()
@@ -699,8 +769,8 @@ RunService.Heartbeat:Connect(function()
             local targetPos = f._target.Position + f.offset
             if not f._lastPos or (targetPos - f._lastPos).Magnitude >= 0.1 then
                 f._lastPos = targetPos
-                pcall(function() char:PivotTo(CFrame.new(targetPos)) end)
-                if hrp then
+                local ok = pcall(function() char:PivotTo(CFrame.new(targetPos)) end)
+                if ok and hrp then
                     hrp.AssemblyLinearVelocity = Vector3.zero
                     hrp.AssemblyAngularVelocity = Vector3.zero
                 end
@@ -717,17 +787,14 @@ RunService.Heartbeat:Connect(function()
     if d._lastHealth and hum.Health < d._lastHealth - 0.01 then
         state.intel.liveSignals += 1
         local safe = findSafeDodgePosition(myPos, nil, "emergency")
-        if safe and applyDodge(safe, "emergency") then
-            registerDodge("emergency")
-        end
+        if safe and applyDodge(safe, "emergency") then registerDodge("emergency") end
     end
     d._lastHealth = hum.Health
 
     overlapParams.FilterDescendantsInstances = { char }
     local parts = workspace:GetPartBoundsInRadius(myPos, d.reactRadius, overlapParams)
 
-    -- find highest-priority threat this frame
-    local bestPart, bestThreat, bestPri = nil, nil, 0
+    local bestPart, bestThreat, bestScore = nil, nil, 0
     for _, part in ipairs(parts) do
         if part ~= hrp then
             local tr = tracked[part]
@@ -738,21 +805,22 @@ RunService.Heartbeat:Connect(function()
             end
             tracked[part] = { pos = part.Position, t = now, lastSeen = now }
 
-            local vel = part.AssemblyLinearVelocity
+            -- v8: выбираем максимальную скорость — физическую ИЛИ дельту
+            local physVel = part.AssemblyLinearVelocity
+            local vel = physVel
             if velFromDelta and velFromDelta.Magnitude > vel.Magnitude then vel = velFromDelta end
 
-            if vel.Magnitude >= 6 then
-                local threat = analyzeThreat(part, myPos)
+            if vel.Magnitude >= 5 then
+                -- v8: передаём vel внутрь analyzeThreat!
+                local threat = analyzeThreat(part, myPos, vel)
                 if threat then
                     local pri = 1
                     if threat.type == "beam" then pri = 3
                     elseif threat.type == "named" then pri = 2 end
-                    -- быстрый триггер: TTI < 0.25 ИЛИ approach > 0.55
-                    if threat.tti < 0.25 or threat.approach > 0.55 then
-                        -- срочность: чем меньше TTI, тем выше приоритет
-                        local urgencyScore = pri * 10 + (1 - math.min(threat.tti, 1))
-                        if urgencyScore > bestPri then
-                            bestPart, bestThreat, bestPri = part, threat, urgencyScore
+                    if threat.tti < 0.30 or threat.approach > 0.5 then
+                        local score = pri * 10 + (1 - math.min(threat.tti, 1))
+                        if score > bestScore then
+                            bestPart, bestThreat, bestScore = part, threat, score
                         end
                     end
                 end
@@ -768,16 +836,34 @@ RunService.Heartbeat:Connect(function()
                         local dist = toPlayer.Magnitude
                         if dist < 12 and part.CFrame.LookVector:Dot(toPlayer.Unit) > 0.5 then
                             local safe = findSafeDodgePosition(myPos, {
-                                dodgeDist = math.max(8, dist + 6),
+                                partPos = part.Position,
                                 impact = part.Position,
-                                vel = toPlayer.Unit,
+                                vel = toPlayer,
+                                dist = dist, tti = 0.1, mag = 20,
+                                partSize = 4,
                             }, "fast")
-                            if safe and applyDodge(safe, "fast") then
-                                registerDodge("fast")
-                            end
+                            if safe and applyDodge(safe, "fast") then registerDodge("fast") end
                         end
                     end
                 end
+            end
+        end
+    end
+
+    -- spawn-track deferred threats (для anchored+CFrame)
+    for part, tr in pairs(spawnTrack) do
+        if not part.Parent then spawnTrack[part] = nil
+        else
+            local dt = now - tr.t
+            if dt > 0.001 then
+                local vel = (part.Position - tr.pos) / dt
+                if vel.Magnitude >= 5 then
+                    local threat = analyzeThreat(part, myPos, vel)
+                    if threat and threat.tti < 0.25 then
+                        tryDodge(part, threat)
+                    end
+                end
+                if now - tr.t > 0.3 then spawnTrack[part] = nil end
             end
         end
     end
@@ -856,7 +942,8 @@ local function scanScriptsAndRemotes()
                     if hit then
                         nScripts += 1
                         if nScripts <= 20 then
-                            addIntelRow("📜 " .. dd:GetFullName() .. " · [" .. hit .. "]", Color3.fromRGB(150, 255, 180))
+                            addIntelRow("📜 " .. dd:GetFullName() .. " · [" .. hit .. "]",
+                                Color3.fromRGB(150, 255, 180))
                         end
                     end
                 end
@@ -892,11 +979,8 @@ followBox.TextColor3 = Color3.new(1, 1, 1); followBox.TextScaled = true
 followBox.ClearTextOnFocus = false; followBox.Parent = panelFollow
 corner(followBox, 4)
 
-stepper(panelFollow, 66, "Смещение Y:",
-    function() return math.floor(state.follow.offset.Y) end,
-    function(v) state.follow.offset = Vector3.new(0, v, 0) end, -20, 30, 1)
-
-local followStatus = mkLabel(panelFollow, "ждёт имя...", UDim2.fromOffset(0, 102), UDim2.new(1, 0, 0, 14))
+local followStatus = mkLabel(panelFollow, "ждёт имя...",
+    UDim2.fromOffset(0, 66), UDim2.new(1, 0, 0, 14))
 followStatus.TextColor3 = Color3.fromRGB(150, 200, 255); followStatus.TextSize = 10
 
 followBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -930,38 +1014,49 @@ end)
 local dragging, dragStart, startPos = false, nil, nil
 local resizing, rStart, rStartSize = false, nil, nil
 dragBar.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        dragging = true; dragStart = Vector2.new(input.Position.X, input.Position.Y); startPos = frame.Position
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        dragging = true; dragStart = Vector2.new(input.Position.X, input.Position.Y)
+        startPos = frame.Position
     end
 end)
-local rh = mkBtn(frame, "◢", UDim2.new(1, -14, 1, -14), UDim2.fromOffset(12, 12), Color3.fromRGB(255, 40, 65))
+local rh = mkBtn(frame, "◢", UDim2.new(1, -14, 1, -14), UDim2.fromOffset(12, 12),
+    Color3.fromRGB(255, 40, 65))
 rh.ZIndex = 20; rh.TextSize = 8
 rh.InputBegan:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-        resizing = true; rStart = Vector2.new(input.Position.X, input.Position.Y); rStartSize = frame.AbsoluteSize
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = true; rStart = Vector2.new(input.Position.X, input.Position.Y)
+        rStartSize = frame.AbsoluteSize
     end
 end)
 UIS.InputChanged:Connect(function(input)
-    local isMouse = input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch
+    local isMouse = input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
     if not isMouse then return end
     local cur = Vector2.new(input.Position.X, input.Position.Y)
     if dragging then
         local d = cur - dragStart
-        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X, startPos.Y.Scale, startPos.Y.Offset + d.Y)
+        frame.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + d.X,
+            startPos.Y.Scale, startPos.Y.Offset + d.Y)
     elseif resizing then
         local d = cur - rStart
-        frame.Size = UDim2.fromOffset(math.max(240, rStartSize.X + d.X), math.max(240, rStartSize.Y + d.Y))
+        frame.Size = UDim2.fromOffset(math.max(240, rStartSize.X + d.X),
+            math.max(240, rStartSize.Y + d.Y))
     end
 end)
 UIS.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+    if input.UserInputType == Enum.UserInputType.MouseButton1
+       or input.UserInputType == Enum.UserInputType.Touch then
         dragging = false; resizing = false
     end
 end)
 
-local reopenBtn = mkBtn(gui, "☰", UDim2.new(0, 20, 0.15, 0), UDim2.fromOffset(36, 36), Color3.fromRGB(120, 25, 45))
+local reopenBtn = mkBtn(gui, "☰", UDim2.new(0, 20, 0.15, 0), UDim2.fromOffset(36, 36),
+    Color3.fromRGB(120, 25, 45))
 reopenBtn.Visible = false; reopenBtn.Draggable = true
-local ro = Instance.new("UIStroke"); ro.Color = Color3.fromRGB(255, 40, 65); ro.Thickness = 1.5; ro.Parent = reopenBtn
+local ro = Instance.new("UIStroke")
+ro.Color = Color3.fromRGB(255, 40, 65); ro.Thickness = 1.5; ro.Parent = reopenBtn
 closeBtn.Activated:Connect(function() frame.Visible = false; reopenBtn.Visible = true end)
 reopenBtn.Activated:Connect(function() frame.Visible = true; reopenBtn.Visible = false end)
 
@@ -984,4 +1079,4 @@ end)
 
 switchTab("parts"); scanWorkspace(); refreshPartList(); dodgeStats.Text = getStatsText()
 
-print("[FNVB] v7 loaded OK — hover + fast-dodge ready")
+print("[FNVB] v8 loaded OK — velocity passthrough + 4-dir fallback + auto-dist")
